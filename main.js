@@ -927,10 +927,9 @@ function drawRemoteTracer(originArr, dirArr) {
   activeTracers.push({ mesh: line, life: 1, permanent: false });
 }
 
-function startNetwork(serverUrl, playerName) {
+function startNetwork(playerName) {
   network = createNetworkSystem({
     scene,
-    serverUrl,
     playerName: playerName || 'Player',
     eyeHeight: STAND_HEIGHT,
     onLocalPlayerHit: (fromId, damage) => {
@@ -948,10 +947,15 @@ function startNetwork(serverUrl, playerName) {
 
 const mpLogin = document.getElementById('mp-login');
 const mpConnectBtn = document.getElementById('mp-connect-btn');
+const mpSoloBtn = document.getElementById('mp-solo-btn');
+
 mpConnectBtn.addEventListener('click', () => {
   const name = document.getElementById('mp-name').value.trim() || 'Player';
-  const url = document.getElementById('mp-url').value.trim();
-  if (url) startNetwork(url, name);
+  startNetwork(name);
+  mpLogin.style.display = 'none';
+});
+
+mpSoloBtn.addEventListener('click', () => {
   mpLogin.style.display = 'none';
 });
 

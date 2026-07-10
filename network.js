@@ -1,34 +1,64 @@
 import * as THREE from 'three';
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js';
+import {
+  getDatabase, ref, set, update, remove, onValue, onDisconnect,
+  push, onChildAdded, serverTimestamp, get,
+} from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-database.js';
 
 // -----------------------------
-// MULTIPLAYER NETWORK MODULE
-// Talks to server.js over WebSocket. Handles the connection, sends your
-// local state at a steady rate, and owns the "remote player" meshes so
-// main.js doesn't have to know anything about sockets - it just calls
-// the handful of functions returned by createNetworkSystem().
+// MULTIPLAYER NETWORK MODULE (Firebase Realtime Database backend)
+// -----------------------------
+// This replaces the old WebSocket relay (server.js) entirely. Firebase's
+// free "Spark" tier hosts the realtime sync for you - no server to run,
+// no ngrok, no port forwarding. Every player's browser talks directly to
+// Firebase, and Firebase fans the updates out to everyone else.
+//
+// SETUP (one-time, see FIREBASE_SETUP.txt for full steps):
+//   1. Create a free Firebase project at https://console.firebase.google.com
+//   2. Enable "Realtime Database" (not Firestore) in test/locked mode
+//   3. Paste your project's config into FIREBASE_CONFIG below
+//   4. Set the database rules from FIREBASE_SETUP.txt
+//
+// NOTE: it's normal and expected for this config object to be public/
+// hardcoded in client-side code - that's how Firebase web apps always
+// work. Access control is enforced by the Database Rules you set in the
+// Firebase console, not by hiding these values.
 // -----------------------------
 
-const STATE_SEND_HZ = 20;
-const INTERP_SPEED = 12; // higher = snappier remote-player movement, lower = smoother but laggier
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyBPTvko5VgB1Tlo81e_ez_1mvoRhBypjWs",
+  authDomain: "potatoshooter-19fd7.firebaseapp.com",
+  databaseURL: "https://potatoshooter-19fd7-default-rtdb.firebaseio.com",
+  projectId: "potatoshooter-19fd7",
+};
+
+const STATE_SEND_HZ = 15;
+const INTERP_SPEED = 12;
+const STALE_PLAYER_MS = 10000; // if a player's data hasn't updated in this long, drop them locally
 
 /**
  * @param {object} deps
  * @param {THREE.Scene} deps.scene
- * @param {string} deps.serverUrl - e.g. "ws://1.2.3.4:8643" or "wss://yourdomain.com"
  * @param {string} deps.playerName
- * @param {(fromId: string, damage: number) => void} deps.onLocalPlayerHit - called when a 'hit' event targets us
- * @param {(id: string, origin: number[], dir: number[], weaponIndex: number) => void} deps.onRemoteShot - called to play a tracer/visual for someone else's shot
- * @param {number} [deps.eyeHeight=1.8] - your STAND_HEIGHT constant; used to convert the eye-level position we send over the network back into a feet-on-ground position for the remote player mesh
+ * @param {(fromId: string, damage: number) => void} deps.onLocalPlayerHit
+ * @param {(id: string, origin: number[], dir: number[], weaponIndex: number) => void} deps.onRemoteShot
+ * @param {number} [deps.eyeHeight=1.8]
  */
 export function createNetworkSystem(deps) {
-  const { scene, serverUrl, playerName, onLocalPlayerHit, onRemoteShot, eyeHeight = 1.8 } = deps;
+  const { scene, playerName, onLocalPlayerHit, onRemoteShot, eyeHeight = 1.8 } = deps;
 
-  let ws = null;
-  let myId = null;
+  const app = initializeApp(FIREBASE_CONFIG);
+  const db = getDatabase(app);
+
+  const myId = push(ref(db, 'players')).key; // generate a unique id up front
+  const myPlayerRef = ref(db, `players/${myId}`);
+  const eventsRef = ref(db, 'events');
+
   let connected = false;
-  let latestLocalState = null; // { pos, rotY, weaponIndex, hp } - updated every frame, sent on a real timer
+  let latestLocalState = null;
+  const seenEventKeys = new Set();
 
-  /** @type {Map<string, { root: THREE.Group, nameSprite: THREE.Sprite, targetPos: THREE.Vector3, targetRotY: number, hp: number, name: string }>} */
+  /** @type {Map<string, { root, nameSprite, targetPos, targetRotY, hp, name, lastUpdate }>} */
   const remotePlayers = new Map();
 
   function makeNameSprite(name) {
@@ -57,7 +87,7 @@ export function createNetworkSystem(deps) {
     const bodyMat = new THREE.MeshStandardMaterial({
       color: 0x3388ff,
       roughness: 0.6,
-      side: THREE.DoubleSide, // visible even if the local camera ends up inside it
+      side: THREE.DoubleSide,
       emissive: 0x1144aa,
       emissiveIntensity: 0.3,
     });
@@ -75,17 +105,29 @@ export function createNetworkSystem(deps) {
     return { root, nameSprite };
   }
 
-  function addRemotePlayer(id, name, pos, rotY, hp) {
-    if (remotePlayers.has(id)) return;
-    const { root, nameSprite } = makeRemotePlayerMesh(name, id);
-    root.position.set(pos[0], pos[1] - eyeHeight, pos[2]);
-    remotePlayers.set(id, {
-      root, nameSprite,
-      targetPos: new THREE.Vector3(pos[0], pos[1] - eyeHeight, pos[2]),
-      targetRotY: rotY,
-      hp, name,
-    });
-    console.log(`[net] spawned remote player "${name}" (${id}) at`, pos);
+  function addOrUpdateRemotePlayer(id, data) {
+    if (id === myId || !data) return;
+    const pos = data.pos || [50, eyeHeight, 0];
+    const feetY = pos[1] - eyeHeight;
+
+    if (!remotePlayers.has(id)) {
+      const { root, nameSprite } = makeRemotePlayerMesh(data.name || 'Player', id);
+      root.position.set(pos[0], feetY, pos[2]);
+      remotePlayers.set(id, {
+        root, nameSprite,
+        targetPos: new THREE.Vector3(pos[0], feetY, pos[2]),
+        targetRotY: data.rotY || 0,
+        hp: data.hp, name: data.name,
+        lastUpdate: Date.now(),
+      });
+      console.log(`[net] spawned remote player "${data.name}" (${id})`);
+    } else {
+      const rp = remotePlayers.get(id);
+      rp.targetPos.set(pos[0], feetY, pos[2]);
+      rp.targetRotY = data.rotY || 0;
+      rp.hp = data.hp;
+      rp.lastUpdate = Date.now();
+    }
   }
 
   function removeRemotePlayer(id) {
@@ -100,87 +142,76 @@ export function createNetworkSystem(deps) {
     remotePlayers.delete(id);
   }
 
-  function applySnapshot(list) {
-    const seen = new Set();
-    for (const p of list) {
-      if (p.id === myId) continue;
-      seen.add(p.id);
-      if (!remotePlayers.has(p.id)) {
-        addRemotePlayer(p.id, p.name, p.pos, p.rotY, p.hp);
-      } else {
-        const rp = remotePlayers.get(p.id);
-        rp.targetPos.set(p.pos[0], p.pos[1] - eyeHeight, p.pos[2]);
-        rp.targetRotY = p.rotY;
-        rp.hp = p.hp;
-      }
-    }
-    // Clean up anyone in our local map who dropped out of the last snapshot
-    for (const id of remotePlayers.keys()) {
-      if (!seen.has(id)) removeRemotePlayer(id);
-    }
-  }
+  async function connect() {
+    console.log('[net] connecting to Firebase...');
 
-  function connect() {
-    console.log(`[net] connecting to ${serverUrl} ...`);
-    ws = new WebSocket(serverUrl);
-
-    ws.addEventListener('open', () => {
-      console.log('[net] socket open, joining as', playerName);
-      ws.send(JSON.stringify({ type: 'join', name: playerName }));
+    // Announce ourselves, and make sure our node auto-deletes if we
+    // close the tab, lose power, whatever - no server-side timeout
+    // logic needed, Firebase handles this natively.
+    await set(myPlayerRef, {
+      name: playerName,
+      pos: [50, eyeHeight, 0],
+      rotY: 0,
+      weaponIndex: 0,
+      hp: 150,
+      updatedAt: serverTimestamp(),
     });
+    onDisconnect(myPlayerRef).remove();
 
-    ws.addEventListener('message', (ev) => {
-      let msg;
-      try { msg = JSON.parse(ev.data); } catch { return; }
+    connected = true;
+    console.log(`[net] connected as ${myId}`);
 
-      switch (msg.type) {
-        case 'welcome':
-          myId = msg.id;
-          connected = true;
-          for (const p of msg.players) addRemotePlayer(p.id, p.name, p.pos, p.rotY, p.hp);
-          console.log(`[net] connected as ${myId}`);
-          break;
-        case 'snapshot':
-          applySnapshot(msg.players);
-          break;
-        case 'playerJoined':
-          console.log(`[net] ${msg.name} joined`);
-          break;
-        case 'playerLeft':
-          removeRemotePlayer(msg.id);
-          break;
-        case 'shoot':
-          if (onRemoteShot) onRemoteShot(msg.id, msg.origin, msg.dir, msg.weaponIndex);
-          break;
-        case 'hit':
-          if (msg.targetId === myId && onLocalPlayerHit) onLocalPlayerHit(msg.from, msg.damage);
-          break;
+    // Listen for the full roster of players
+    onValue(ref(db, 'players'), (snapshot) => {
+      const all = snapshot.val() || {};
+      const seen = new Set();
+      for (const [id, data] of Object.entries(all)) {
+        if (id === myId) continue;
+        seen.add(id);
+        addOrUpdateRemotePlayer(id, data);
+      }
+      for (const id of remotePlayers.keys()) {
+        if (!seen.has(id)) removeRemotePlayer(id);
       }
     });
 
-    ws.addEventListener('close', () => {
-      connected = false;
-      console.log('[net] disconnected, retrying in 2s...');
-      setTimeout(connect, 2000);
-    });
+    // Listen for shoot/hit events (a shared append-only list, pruned as we go)
+    onChildAdded(eventsRef, (snapshot) => {
+      const key = snapshot.key;
+      const evt = snapshot.val();
+      if (!evt || seenEventKeys.has(key)) return;
+      seenEventKeys.add(key);
 
-    ws.addEventListener('error', (e) => { console.error('[net] socket error', e); });
+      if (evt.type === 'shoot' && evt.from !== myId) {
+        if (onRemoteShot) onRemoteShot(evt.from, evt.origin, evt.dir, evt.weaponIndex);
+      } else if (evt.type === 'hit' && evt.targetId === myId) {
+        if (onLocalPlayerHit) onLocalPlayerHit(evt.from, evt.damage);
+      }
+
+      // Clean up old events lazily so the list doesn't grow forever.
+      // (Simple approach: remove it once we've processed it. Fine for a
+      // small friend group - if you ever need replay/history, don't do this.)
+      remove(ref(db, `events/${key}`)).catch(() => {});
+    });
   }
 
   connect();
 
-  // IMPORTANT: this runs on a real timer, not requestAnimationFrame.
-  // Backgrounded browser tabs throttle rAF (sometimes to ~1fps or less),
-  // which used to make network sends stop and get the client kicked by
-  // the server's idle timeout. setInterval is throttled far less
-  // aggressively, so state keeps flowing even if the tab loses focus.
   setInterval(() => {
     if (!connected || !latestLocalState) return;
-    ws.send(JSON.stringify({ type: 'state', ...latestLocalState }));
+    update(myPlayerRef, { ...latestLocalState, updatedAt: serverTimestamp() }).catch(() => {});
   }, 1000 / STATE_SEND_HZ);
 
+  // Safety net: prune remote players we haven't heard from in a while,
+  // in case an onDisconnect didn't fire cleanly (e.g. hard crash).
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, rp] of remotePlayers) {
+      if (now - rp.lastUpdate > STALE_PLAYER_MS) removeRemotePlayer(id);
+    }
+  }, 3000);
+
   return {
-    /** Call once per frame from animate(). Records local state (sent on its own timer) and interpolates remote players. */
     update(delta, playerPos, cameraRotY, weaponIndex, hp) {
       latestLocalState = {
         pos: [playerPos.x, playerPos.y, playerPos.z],
@@ -196,31 +227,24 @@ export function createNetworkSystem(deps) {
       }
     },
 
-    /** Call when the local player fires, so others see it. */
     sendShoot(originVec3, dirVec3, weaponIndex) {
       if (!connected) return;
-      ws.send(JSON.stringify({
+      push(eventsRef, {
         type: 'shoot',
+        from: myId,
         origin: [originVec3.x, originVec3.y, originVec3.z],
         dir: [dirVec3.x, dirVec3.y, dirVec3.z],
         weaponIndex,
-      }));
+      }).catch(() => {});
     },
 
-    /** Call when the local player's raycast hits a known remote player's hitbox. */
     sendHit(targetId, damage) {
       if (!connected) return;
-      ws.send(JSON.stringify({ type: 'hit', targetId, damage }));
+      push(eventsRef, { type: 'hit', from: myId, targetId, damage }).catch(() => {});
     },
 
-    /** Returns [ [id, {root, targetPos, ...}], ... ] so main.js can raycast against remote hitboxes if desired. */
     getRemotePlayers() { return remotePlayers; },
-
-    /** Flat array of the actual mesh objects to hand to raycaster.intersectObjects(). */
-    getRemotePlayerMeshes() {
-      return [...remotePlayers.values()].map(rp => rp.root);
-    },
-
+    getRemotePlayerMeshes() { return [...remotePlayers.values()].map(rp => rp.root); },
     isConnected() { return connected; },
     getMyId() { return myId; },
   };
