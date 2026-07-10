@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Basic GLTF FPS Demo</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: monospace; }
+  #crosshair {
+    position: fixed; top: 50%; left: 50%; width: 6px; height: 6px;
+    margin: -3px 0 0 -3px; border-radius: 50%; background: #0f0;
+    pointer-events: none; z-index: 10;
+  }
+  #hud {
+    position: fixed; bottom: 10px; left: 10px; color: #0f0;
+    font-size: 14px; z-index: 10; white-space: pre; text-shadow: 1px 1px 2px #000;
+  }
+  #blocker {
+    position: fixed; inset: 0; background: transparent;
+    z-index: 20; cursor: pointer;
+  }
+  #scope {
+    position: fixed; inset: 0; display: none; z-index: 15; pointer-events: none;
+  }
+  #scope::before {
+    content: ''; position: absolute; inset: 0; background: #000;
+    -webkit-mask: radial-gradient(circle at 50% 50%, transparent 0 28vh, #000 28.2vh);
+    mask: radial-gradient(circle at 50% 50%, transparent 0 28vh, #000 28.2vh);
+  }
+  #mp-login {
+    position: fixed; inset: 0; z-index: 30; background: rgba(0,0,0,0.9);
+    color: #0f0; display: flex; align-items: center; justify-content: center;
+  }
+  #mp-login .box { display: flex; flex-direction: column; gap: 10px; width: 320px; }
+  #mp-login input {
+    background: #111; border: 1px solid #0f0; color: #0f0; padding: 8px;
+    font-family: monospace; font-size: 14px;
+  }
+  #mp-login button {
+    background: #0f0; color: #000; border: none; padding: 10px; font-weight: bold;
+    font-family: monospace; cursor: pointer;
+  }
+  #mp-login .hint { font-size: 11px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<div id="crosshair"></div>
+<div id="scope"></div>
+<div id="hud">Loading...</div>
+<div id="blocker"></div>
+
+<div id="mp-login">
+  <div class="box">
+    <div>MULTIPLAYER CONNECT</div>
+    <input id="mp-name" placeholder="Your name" maxlength="24">
+    <input id="mp-url" placeholder="ws://host:8643 (blank = solo)">
+    <button id="mp-connect-btn">PLAY</button>
+    <div class="hint">Leave the server field blank to play solo, offline.</div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="./main.js"></script>
+</body>
+</html>
