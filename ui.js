@@ -181,10 +181,6 @@ export function createUISystem(deps) {
           <button id="btn-tracers">OFF</button>
         </div>
         <div style="margin-bottom:10px;">
-          <label>Wireframe:</label>
-          <button id="btn-wireframe">OFF</button>
-        </div>
-        <div style="margin-bottom:10px;">
           <label>Collision Capsule Mesh Visible:</label>
           <button id="btn-visible-player">OFF</button>
         </div>
@@ -219,7 +215,6 @@ export function createUISystem(deps) {
 
     const btnResume = document.getElementById('btn-resume');
     const btnTracers = document.getElementById('btn-tracers');
-    const btnWireframe = document.getElementById('btn-wireframe');
     const btnVisiblePlayer = document.getElementById('btn-visible-player');
     const btnGraphics = document.getElementById('btn-graphics');
     const btnAA = document.getElementById('btn-aa');
@@ -238,14 +233,6 @@ export function createUISystem(deps) {
           scene.remove(t.mesh);
         }
       }
-    });
-
-    btnWireframe.addEventListener('click', () => {
-      settings.wireframe = !settings.wireframe;
-      btnWireframe.textContent = settings.wireframe ? 'ON' : 'OFF';
-      getCollidables().forEach(obj => {
-        if (obj.material) obj.material.wireframe = settings.wireframe;
-      });
     });
 
     btnVisiblePlayer.addEventListener('click', () => {
@@ -289,36 +276,49 @@ export function createUISystem(deps) {
   function updateScoreboard(rows, isAdminFlag, onBanClick) {
     const tbody = document.getElementById('scoreboard-body');
     if (!tbody) return;
-    if (!rows || rows.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="4" style="padding:4px; opacity:0.6;">Not connected to a server.</td></tr>';
-      return;
-    }
-    tbody.innerHTML = '';
-    rows.forEach((row) => {
-      const tr = document.createElement('tr');
-      tr.style.borderBottom = '1px solid #333';
-      const isYou = row.name.endsWith('(you)');
-      const banCell = (isAdminFlag && !isYou && row.uid)
-        ? `<button data-uid="${row.uid}" class="scoreboard-ban-btn" style="background:#661111; color:#fff; border:none; padding:2px 8px; cursor:pointer;">BAN</button>`
-        : '';
-      tr.innerHTML = `
-        <td style="padding:4px 12px 4px 0;">${row.name}</td>
-        <td style="padding:4px 12px;">${row.kills}</td>
-        <td style="padding:4px 12px;">${row.deaths}</td>
-        <td style="padding:4px 12px;">${banCell}</td>
-      `;
-      tbody.appendChild(tr);
-    });
-
-    if (isAdminFlag && onBanClick) {
-      tbody.querySelectorAll('.scoreboard-ban-btn').forEach((btn) => {
-        btn.addEventListener('click', () => onBanClick(btn.dataset.uid));
+    try {
+      if (!rows || rows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" style="padding:4px; opacity:0.6;">Not connected to a server.</td></tr>';
+        return;
+      }
+      const newTbody = document.createElement('tbody');
+      newTbody.id = 'scoreboard-body';
+      rows.forEach((row) => {
+        try {
+          const tr = document.createElement('tr');
+          tr.style.borderBottom = '1px solid #333';
+          const name = row && row.name ? String(row.name) : 'Player';
+          const kills = (row && row.kills) || 0;
+          const deaths = (row && row.deaths) || 0;
+          const isYou = name.endsWith('(you)');
+          const banCell = (isAdminFlag && !isYou && row && row.uid)
+            ? `<button data-uid="${row.uid}" class="scoreboard-ban-btn" style="background:#661111; color:#fff; border:none; padding:2px 8px; cursor:pointer;">BAN</button>`
+            : '';
+          tr.innerHTML = `
+            <td style="padding:4px 12px 4px 0;">${name}</td>
+            <td style="padding:4px 12px;">${kills}</td>
+            <td style="padding:4px 12px;">${deaths}</td>
+            <td style="padding:4px 12px;">${banCell}</td>
+          `;
+          newTbody.appendChild(tr);
+        } catch (rowErr) {
+          console.warn('[scoreboard] skipped a malformed row', rowErr, row);
+        }
       });
+      tbody.replaceWith(newTbody);
+
+      if (isAdminFlag && onBanClick) {
+        newTbody.querySelectorAll('.scoreboard-ban-btn').forEach((btn) => {
+          btn.addEventListener('click', () => onBanClick(btn.dataset.uid));
+        });
+      }
+    } catch (err) {
+      console.warn('[scoreboard] render failed', err);
     }
   }
 
   function setAdminMode(isAdminFlag) {
-    ['btn-tracers', 'btn-wireframe', 'btn-visible-player'].forEach((id) => {
+    ['btn-tracers', 'btn-visible-player'].forEach((id) => {
       const btn = document.getElementById(id);
       if (!btn) return;
       const row = btn.closest('div');

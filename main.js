@@ -13,7 +13,7 @@ import {
 } from './config.js';
 import { createUISystem } from './ui.js';
 import { TargetCube } from './targetCube.js'; // IMPORTED TARGET CUBE
-import { createNetworkSystem, loginOrSignUp, fetchRoomCounts, banPlayer } from './network.js';
+import { createNetworkSystem, loginOrSignUp, fetchRoomCounts, banPlayer, watchAuthState, logOut } from './network.js';
 
 // ENGINE SETTINGS
 let playerHp = 150;
@@ -28,6 +28,7 @@ let effectiveMaxHp = MAX_HP;
 let armorHp = 0;                // Heavy's flat non-regen shield, if the coinflip lands
 let usedLuckySurvive = false;   // Lucky's "survive lethal" - once per life
 let allowedWeaponIndices = new Set(WEAPON_CONFIGS.map((_, i) => i)); // until a loadout is picked, allow everything (solo default)
+let loadoutOrder = WEAPON_CONFIGS.map((_, i) => i); // [secondaryIdx, primary1Idx, primary2Idx] once a loadout is picked - keys 1/2/3 map to this order, not the weapon's fixed array position
 
 const settings = {
   debugTracers: false,
@@ -207,11 +208,13 @@ document.addEventListener('wheel', (e) => {
   if (!controls.isLocked) return;
   
   const step = e.deltaY > 0 ? 1 : -1;
-  let targetIndex = currentIndex;
-  
-  for (let i = 0; i < weapons.length; i++) {
-    targetIndex = (targetIndex + step + weapons.length) % weapons.length;
-    if (weapons[targetIndex].loaded && allowedWeaponIndices.has(targetIndex)) {
+  const currentSlot = Math.max(0, loadoutOrder.indexOf(currentIndex));
+  let targetSlot = currentSlot;
+
+  for (let i = 0; i < loadoutOrder.length; i++) {
+    targetSlot = (targetSlot + step + loadoutOrder.length) % loadoutOrder.length;
+    const targetIndex = loadoutOrder[targetSlot];
+    if (weapons[targetIndex] && weapons[targetIndex].loaded && allowedWeaponIndices.has(targetIndex)) {
       switchWeapon(targetIndex);
       break;
     }
@@ -412,11 +415,11 @@ function updateHud() {
     return;
   }
 
-  lines.push(WEAPON_CONFIGS.map((cfg, i) => {
-    if (!allowedWeaponIndices.has(i)) return null;
+  lines.push(loadoutOrder.map((i, slot) => {
+    const cfg = WEAPON_CONFIGS[i];
     const tag = weapons[i].loaded ? cfg.name : `${cfg.name} (missing)`;
-    return i === currentIndex ? `[${i + 1}:${tag}]` : `${i + 1}:${tag}`;
-  }).filter(Boolean).join('  '));
+    return i === currentIndex ? `[${slot + 1}:${tag}]` : `${slot + 1}:${tag}`;
+  }).join('  '));
 
   const w = W();
   if (w.loaded) {
@@ -496,14 +499,15 @@ function tryReload() {
   w.isReloading = true; w.isBusy = true;
   updateHud();
 
+  // Pick the reload clip based on how many bullets are being inserted
+  // (magSize - ammo), not how many remain - e.g. Sniper: 1 bullet left
+  // means 4 are being loaded, so it plays 'reload4', not 'reload1'.
+  // Falls back to the plain 'reload' clip if no specific numbered one
+  // exists for that count (e.g. sniper's full-empty reload).
+  const bulletsMissing = w.cfg.magSize - w.ammo;
   let animName = 'reload';
-  if (w.cfg.name === 'Double Barrel') {
-    // ammo remaining tells us how many barrels are still loaded
-    if (w.ammo === 1 && w.actions['reload1']) animName = 'reload1';
-    else if (w.ammo === 0 && w.actions['reload2']) animName = 'reload2';
-  } else if (w.cfg.name === 'Sniper') {
-    // reload{ammo} for 1-4 bullets remaining, plain 'reload' (all 5) when fully empty
-    if (w.ammo >= 1 && w.ammo <= 4 && w.actions[`reload${w.ammo}`]) animName = `reload${w.ammo}`;
+  if (bulletsMissing > 0 && w.actions[`reload${bulletsMissing}`]) {
+    animName = `reload${bulletsMissing}`;
   }
 
   playAnim(w, animName, {
@@ -687,12 +691,6 @@ document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Tab') { e.preventDefault(); toggleMenu(); return; }
-  if (!isAdmin) {
-    if (e.code === 'BracketLeft' || e.code === 'BracketRight') return; // debug tools, admin only
-  } else {
-    if (e.code === 'BracketLeft') { noclip = !noclip; if (noclip) { verticalVelocity = 0; grounded = true; } updateHud(); return; }
-    if (e.code === 'BracketRight') { freecam = !freecam; if (freecam) freecamPos.copy(cameraGroup.position); updateHud(); return; }
-  }
 
   if (!controls.isLocked) return;
   switch (e.code) {
@@ -700,13 +698,14 @@ document.addEventListener('keydown', (e) => {
     case 'KeyH': tryInspect(); break;
     case 'KeyT': tryBolt(); break; 
     case 'Space':
-      if (grounded && !noclip && !freecam) { verticalVelocity = JUMP_SPEED; grounded = false; }
+      if (grounded) { verticalVelocity = JUMP_SPEED; grounded = false; }
       break;
     default:
       const m = /^Digit([1-9])$/.exec(e.code);
       if (m) {
-        const idx = parseInt(m[1], 10) - 1;
-        if (allowedWeaponIndices.has(idx)) switchWeapon(idx);
+        const slot = parseInt(m[1], 10) - 1; // 0=secondary, 1=primary1, 2=primary2
+        const idx = loadoutOrder[slot];
+        if (idx !== undefined && allowedWeaponIndices.has(idx)) switchWeapon(idx);
       }
   }
 });
@@ -881,6 +880,7 @@ loadoutConfirmBtn.addEventListener('click', () => {
   const p1Idx = parseInt(primary1Select.value, 10);
   const p2Idx = parseInt(primary2Select.value, 10);
   allowedWeaponIndices = new Set([secIdx, p1Idx, p2Idx]);
+  loadoutOrder = [secIdx, p1Idx, p2Idx];
 
   // Reset ammo on the chosen loadout so every life starts topped up
   [secIdx, p1Idx, p2Idx].forEach((i) => {
@@ -894,6 +894,7 @@ loadoutConfirmBtn.addEventListener('click', () => {
   if (special.id === 'heavy' && armorCheckbox.checked) {
     // Player explicitly chose to run Armor instead of their Primary 2 weapon
     allowedWeaponIndices.delete(p2Idx);
+    loadoutOrder = loadoutOrder.filter((i) => i !== p2Idx);
     armorHp = HEAVY_ARMOR_HP;
     if (currentIndex === p2Idx) currentIndex = secIdx;
     armorFlipEl.textContent = `Running Armor instead of ${WEAPON_CONFIGS[p2Idx].name}: +${HEAVY_ARMOR_HP} armor (non-regenerating).`;
@@ -1031,6 +1032,7 @@ function movePlayer(delta) {
 }
 
 let scoreboardRefreshTimer = 0;
+let wasMenuOpenLastFrame = false;
 
 // MAIN LOOP & OFFSETS
 function animate() {
@@ -1052,7 +1054,7 @@ function animate() {
   }
 
   if (network) {
-    network.update(delta, playerPos, cameraGroup.rotation.y, currentIndex, playerHp, moveState.crouching, currentLean, computeScaleMultiplier());
+    network.tick(delta);
   }
 
   if (controls.isLocked) {
@@ -1159,18 +1161,24 @@ function animate() {
   playerHitbox.visible = settings.visiblePlayer;
 
   const gameMenuEl = document.getElementById('game-menu');
-  if (gameMenuEl && gameMenuEl.style.display !== 'none') {
+  const menuIsOpen = gameMenuEl && gameMenuEl.style.display !== 'none';
+  if (menuIsOpen) {
     scoreboardRefreshTimer += delta;
-    if (scoreboardRefreshTimer >= 0.5) {
+    if (!wasMenuOpenLastFrame || scoreboardRefreshTimer >= 0.5) {
       scoreboardRefreshTimer = 0;
-      const rows = network ? network.getScoreboard() : [];
-      updateScoreboard(rows, isAdmin, (targetUid) => {
-        if (confirm('Ban this player? They will be blocked from logging in again.')) {
-          banPlayer(targetUid).catch((err) => alert('Ban failed: ' + err.message));
-        }
-      });
+      try {
+        const rows = network ? network.getScoreboard() : [];
+        updateScoreboard(rows, isAdmin, (targetUid) => {
+          if (confirm('Ban this player? They will be blocked from logging in again.')) {
+            banPlayer(targetUid).catch((err) => alert('Ban failed: ' + err.message));
+          }
+        });
+      } catch (err) {
+        console.warn('[scoreboard] refresh failed', err);
+      }
     }
   }
+  wasMenuOpenLastFrame = menuIsOpen;
 
   sunGroup.children.forEach(sprite => {
     sprite.lookAt(cameraGroup.position);
@@ -1225,6 +1233,15 @@ function startNetwork(uid, playerName, room, adminFlag) {
     playerName,
     room,
     eyeHeight: STAND_HEIGHT,
+    getLocalState: () => ({
+      pos: [playerPos.x, playerPos.y, playerPos.z],
+      rotY: cameraGroup.rotation.y,
+      crouch: !!moveState.crouching,
+      lean: currentLean || 0,
+      scale: computeScaleMultiplier(),
+      weaponIndex: currentIndex,
+      hp: playerHp,
+    }),
     onLocalPlayerHit: (fromId, fromName, damage, isHeadshot, bodyEquivalentDamage) => {
       if (isDead) return;
 
@@ -1291,6 +1308,7 @@ const mpSoloBtn = document.getElementById('mp-solo-btn');
 const welcomeNameEl = document.getElementById('mp-welcome-name');
 const displayNameInput = document.getElementById('mp-display-name');
 const roomListEl = document.getElementById('mp-room-list');
+const logoutBtn = document.getElementById('mp-logout-btn');
 
 let authMode = 'login';
 tabLogin.addEventListener('click', () => {
@@ -1327,6 +1345,7 @@ authSubmitBtn.addEventListener('click', async () => {
 });
 
 async function populateRoomList() {
+  displayNameInput.value = localStorage.getItem('potatoshooter_display_name') || '';
   roomListEl.innerHTML = 'Loading server list...';
   const counts = await fetchRoomCounts(ROOMS).catch(() => ({}));
   roomListEl.innerHTML = '';
@@ -1337,6 +1356,7 @@ async function populateRoomList() {
     btn.innerHTML = `<span>${room}</span><span>${count} online</span>`;
     btn.addEventListener('click', () => {
       const name = displayNameInput.value.trim() || 'Player';
+      localStorage.setItem('potatoshooter_display_name', name);
       startNetwork(pendingUid, name, room, pendingIsAdmin);
       mpLogin.style.display = 'none';
       openLoadoutScreen(() => actuallyRespawn());
@@ -1345,12 +1365,45 @@ async function populateRoomList() {
   });
 }
 
+logoutBtn.addEventListener('click', async () => {
+  await logOut();
+  pendingUid = null;
+  pendingIsAdmin = false;
+  roomPanel.style.display = 'none';
+  authPanel.style.display = 'flex';
+  emailInput.value = '';
+  passwordInput.value = '';
+});
+
 mpSoloBtn.addEventListener('click', () => {
   isAdmin = true; // solo/offline play - no one else around, debug tools are fine
   setAdminMode(isAdmin);
   mpLogin.style.display = 'none';
   openLoadoutScreen(() => actuallyRespawn());
 });
+
+let restoredSession = null;
+let sessionApplied = false;
+
+watchAuthState((session) => {
+  restoredSession = session;
+  tryApplyRestoredSession();
+});
+
+function tryApplyRestoredSession() {
+  if (sessionApplied || !restoredSession) return;
+  if (assetsLoaded < TOTAL_ASSETS_TO_LOAD) return;      // wait for asset loading to finish
+  if (mpLogin.style.display !== 'flex') return;          // only relevant while on the login screen
+  if (roomPanel.style.display === 'flex') return;        // already past login (manual login raced us)
+
+  sessionApplied = true;
+  pendingUid = restoredSession.uid;
+  pendingIsAdmin = restoredSession.isAdmin;
+  welcomeNameEl.textContent = restoredSession.email;
+  authPanel.style.display = 'none';
+  roomPanel.style.display = 'flex';
+  populateRoomList();
+}
 
 // -----------------------------
 // LOADING SCREEN
@@ -1367,6 +1420,7 @@ function reportAssetLoaded() {
   if (assetsLoaded >= TOTAL_ASSETS_TO_LOAD) {
     loadingScreen.style.display = 'none';
     mpLogin.style.display = 'flex';
+    tryApplyRestoredSession();
   }
 }
 

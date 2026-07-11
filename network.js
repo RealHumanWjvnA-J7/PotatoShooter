@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js';
 import {
   getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+  onAuthStateChanged, signOut,
 } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js';
 import {
   getDatabase, ref, set, update, remove, onValue, onDisconnect,
@@ -56,6 +57,32 @@ export async function loginOrSignUp(email, password, mode /* 'login' | 'signup' 
   return { uid, isAdmin };
 }
 
+/**
+ * Checks for an already-persisted Firebase Auth session (browsers keep you
+ * logged in across visits by default). Calls back once with either
+ * { uid, email, isAdmin } or null (no session / banned / logged out).
+ */
+export function watchAuthState(callback) {
+  onAuthStateChanged(auth, async (user) => {
+    if (!user) { callback(null); return; }
+
+    const bannedSnap = await get(ref(db, `banned/${user.uid}`));
+    if (bannedSnap.exists()) {
+      await signOut(auth);
+      callback(null);
+      return;
+    }
+
+    const adminSnap = await get(ref(db, `admins/${user.uid}`));
+    const isAdmin = adminSnap.exists() && adminSnap.val() === true;
+    callback({ uid: user.uid, email: user.email, isAdmin });
+  });
+}
+
+export function logOut() {
+  return signOut(auth);
+}
+
 /** Reads player counts for every room, for the room-select screen. */
 export async function fetchRoomCounts(rooms) {
   const counts = {};
@@ -81,22 +108,22 @@ export function banPlayer(uid) {
  * @param {(fromId: string, fromName: string, damage: number) => void} deps.onLocalPlayerHit
  * @param {(killerName: string, victimName: string) => void} deps.onKillFeed
  * @param {(id: string, origin: number[], dir: number[], weaponIndex: number) => void} deps.onRemoteShot
+ * @param {() => object} deps.getLocalState - called on a real timer (not tied to requestAnimationFrame) to pull fresh { pos, rotY, crouch, lean, scale, weaponIndex, hp } - keeps working even in backgrounded/throttled tabs
  * @param {number} [deps.eyeHeight=1.8]
  */
 export function createNetworkSystem(deps) {
-  const { scene, uid, playerName, room, onLocalPlayerHit, onKillFeed, onRemoteShot, eyeHeight = 1.8 } = deps;
+  const { scene, uid, playerName, room, onLocalPlayerHit, onKillFeed, onRemoteShot, eyeHeight = 1.8, getLocalState } = deps;
 
   const myPlayerRef = ref(db, `players/${room}/${uid}`);
   const eventsRef = ref(db, `events/${room}`);
 
   let connected = false;
-  let latestLocalState = null;
   const seenEventKeys = new Set();
 
   /** @type {Map<string, { root, nameSprite, body, targetPos, targetRotY, targetCrouch, targetLean, hp, name, kills, deaths, lastUpdate }>} */
   const remotePlayers = new Map();
 
-  function makeNameSprite(name) {
+  function makeNameTexture(name) {
     const canvas = document.createElement('canvas');
     canvas.width = 256; canvas.height = 64;
     const ctx = canvas.getContext('2d');
@@ -109,7 +136,11 @@ export function createNetworkSystem(deps) {
     ctx.fillText(name, canvas.width / 2, canvas.height / 2);
     const tex = new THREE.CanvasTexture(canvas);
     tex.colorSpace = THREE.SRGBColorSpace;
-    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true }));
+    return tex;
+  }
+
+  function makeNameSprite(name) {
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: makeNameTexture(name), transparent: true }));
     sprite.scale.set(1.6, 0.4, 1);
     sprite.position.y = 2.2;
     return sprite;
@@ -185,6 +216,18 @@ export function createNetworkSystem(deps) {
       rp.kills = data.kills || 0;
       rp.deaths = data.deaths || 0;
       rp.lastUpdate = Date.now();
+
+      // Name can arrive late (race between the player-list snapshot and
+      // their own name write finishing) - if it changes after creation,
+      // update the stored name AND regenerate the visible nametag texture,
+      // which was otherwise frozen at whatever it was on first spawn.
+      if (data.name && data.name !== rp.name) {
+        rp.name = data.name;
+        const oldMap = rp.nameSprite.material.map;
+        rp.nameSprite.material.map = makeNameTexture(data.name);
+        rp.nameSprite.material.needsUpdate = true;
+        oldMap.dispose();
+      }
     }
   }
 
@@ -253,8 +296,21 @@ export function createNetworkSystem(deps) {
   connect();
 
   setInterval(() => {
-    if (!connected || !latestLocalState) return;
-    update(myPlayerRef, { ...latestLocalState, updatedAt: serverTimestamp() }).catch(() => {});
+    if (!connected) return;
+    const state = getLocalState ? getLocalState() : null;
+    if (!state) return;
+    update(myPlayerRef, {
+      pos: state.pos,
+      rotY: state.rotY,
+      crouch: !!state.crouch,
+      lean: state.lean || 0,
+      scale: state.scale || 1,
+      weaponIndex: state.weaponIndex,
+      hp: state.hp,
+      kills: myKills,
+      deaths: myDeaths,
+      updatedAt: serverTimestamp(),
+    }).catch(() => {});
   }, 1000 / STATE_SEND_HZ);
 
   setInterval(() => {
@@ -265,19 +321,12 @@ export function createNetworkSystem(deps) {
   }, 3000);
 
   return {
-    update(delta, playerPos, cameraRotY, weaponIndex, hp, crouching, leanAmt, scale) {
-      latestLocalState = {
-        pos: [playerPos.x, playerPos.y, playerPos.z],
-        rotY: cameraRotY,
-        crouch: !!crouching,
-        lean: leanAmt || 0,
-        scale: scale || 1,
-        weaponIndex,
-        hp,
-        kills: myKills,
-        deaths: myDeaths,
-      };
-
+    // Purely visual now - interpolates remote players toward their last
+    // known network position. Local state capture/sending happens on its
+    // own real timer above (via getLocalState), independent of this
+    // render-loop call, so backgrounded/throttled tabs don't freeze your
+    // reported position while still successfully sending it.
+    tick(delta) {
       const t = Math.min(1, delta * INTERP_SPEED);
       for (const rp of remotePlayers.values()) {
         rp.root.position.lerp(rp.targetPos, t);
@@ -330,8 +379,13 @@ export function createNetworkSystem(deps) {
     getRemotePlayers() { return remotePlayers; },
     getRemotePlayerMeshes() { return [...remotePlayers.values()].map(rp => rp.root); },
     getScoreboard() {
-      const rows = [...remotePlayers.entries()].map(([id, rp]) => ({ uid: id, name: rp.name, kills: rp.kills, deaths: rp.deaths }));
-      rows.push({ uid: null, name: playerName + ' (you)', kills: myKills, deaths: myDeaths });
+      const rows = [...remotePlayers.entries()].map(([id, rp]) => ({
+        uid: id,
+        name: rp.name || 'Player',
+        kills: rp.kills || 0,
+        deaths: rp.deaths || 0,
+      }));
+      rows.push({ uid: null, name: (playerName || 'Player') + ' (you)', kills: myKills, deaths: myDeaths });
       return rows.sort((a, b) => b.kills - a.kills);
     },
     isConnected() { return connected; },
