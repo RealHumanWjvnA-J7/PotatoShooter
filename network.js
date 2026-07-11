@@ -1,34 +1,99 @@
 import * as THREE from 'three';
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js';
+import {
+  getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+} from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js';
+import {
+  getDatabase, ref, set, update, remove, onValue, onDisconnect,
+  push, onChildAdded, serverTimestamp, get,
+} from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-database.js';
 
 // -----------------------------
-// MULTIPLAYER NETWORK MODULE
-// Talks to server.js over WebSocket. Handles the connection, sends your
-// local state at a steady rate, and owns the "remote player" meshes so
-// main.js doesn't have to know anything about sockets - it just calls
-// the handful of functions returned by createNetworkSystem().
+// MULTIPLAYER NETWORK MODULE (Firebase Auth + Realtime Database backend)
+// -----------------------------
+// Free Firebase Spark tier. No server to run. See FIREBASE_GITHUB_SETUP.txt
+// for one-time console setup (enabling Auth, Realtime Database, rules).
+//
+// NOTE: it's normal for this config object to be public in client code -
+// access control is enforced by Database Rules, not by hiding these values.
 // -----------------------------
 
-const STATE_SEND_HZ = 20;
-const INTERP_SPEED = 12; // higher = snappier remote-player movement, lower = smoother but laggier
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyBPTvko5VgB1Tlo81e_ez_1mvoRhBypjWs",
+  authDomain: "potatoshooter-19fd7.firebaseapp.com",
+  databaseURL: "https://potatoshooter-19fd7-default-rtdb.firebaseio.com",
+  projectId: "potatoshooter-19fd7",
+};
+
+const STATE_SEND_HZ = 15;
+const INTERP_SPEED = 12;
+const STALE_PLAYER_MS = 10000;
+
+const app = initializeApp(FIREBASE_CONFIG);
+const auth = getAuth(app);
+const db = getDatabase(app);
+
+/**
+ * Creates or logs into an account. Returns { uid, isAdmin } on success,
+ * throws with a readable .message on failure (bad password, banned, etc).
+ */
+export async function loginOrSignUp(email, password, mode /* 'login' | 'signup' */) {
+  let cred;
+  if (mode === 'signup') {
+    cred = await createUserWithEmailAndPassword(auth, email, password);
+  } else {
+    cred = await signInWithEmailAndPassword(auth, email, password);
+  }
+  const uid = cred.user.uid;
+
+  const bannedSnap = await get(ref(db, `banned/${uid}`));
+  if (bannedSnap.exists()) {
+    throw new Error('This account has been suspended.');
+  }
+
+  const adminSnap = await get(ref(db, `admins/${uid}`));
+  const isAdmin = adminSnap.exists() && adminSnap.val() === true;
+  return { uid, isAdmin };
+}
+
+/** Reads player counts for every room, for the room-select screen. */
+export async function fetchRoomCounts(rooms) {
+  const counts = {};
+  await Promise.all(rooms.map(async (room) => {
+    const snap = await get(ref(db, `players/${room}`));
+    counts[room] = snap.exists() ? Object.keys(snap.val()).length : 0;
+  }));
+  return counts;
+}
+
+/** Admin-only: ban a uid. Enforced server-side by database rules - will
+ *  fail silently (permission denied) if the caller isn't a real admin. */
+export function banPlayer(uid) {
+  return set(ref(db, `banned/${uid}`), true);
+}
 
 /**
  * @param {object} deps
  * @param {THREE.Scene} deps.scene
- * @param {string} deps.serverUrl - e.g. "ws://1.2.3.4:8643" or "wss://yourdomain.com"
+ * @param {string} deps.uid
  * @param {string} deps.playerName
- * @param {(fromId: string, damage: number) => void} deps.onLocalPlayerHit - called when a 'hit' event targets us
- * @param {(id: string, origin: number[], dir: number[], weaponIndex: number) => void} deps.onRemoteShot - called to play a tracer/visual for someone else's shot
- * @param {number} [deps.eyeHeight=1.8] - your STAND_HEIGHT constant; used to convert the eye-level position we send over the network back into a feet-on-ground position for the remote player mesh
+ * @param {string} deps.room
+ * @param {(fromId: string, fromName: string, damage: number) => void} deps.onLocalPlayerHit
+ * @param {(killerName: string, victimName: string) => void} deps.onKillFeed
+ * @param {(id: string, origin: number[], dir: number[], weaponIndex: number) => void} deps.onRemoteShot
+ * @param {number} [deps.eyeHeight=1.8]
  */
 export function createNetworkSystem(deps) {
-  const { scene, serverUrl, playerName, onLocalPlayerHit, onRemoteShot, eyeHeight = 1.8 } = deps;
+  const { scene, uid, playerName, room, onLocalPlayerHit, onKillFeed, onRemoteShot, eyeHeight = 1.8 } = deps;
 
-  let ws = null;
-  let myId = null;
+  const myPlayerRef = ref(db, `players/${room}/${uid}`);
+  const eventsRef = ref(db, `events/${room}`);
+
   let connected = false;
-  let latestLocalState = null; // { pos, rotY, weaponIndex, hp } - updated every frame, sent on a real timer
+  let latestLocalState = null;
+  const seenEventKeys = new Set();
 
-  /** @type {Map<string, { root: THREE.Group, nameSprite: THREE.Sprite, targetPos: THREE.Vector3, targetRotY: number, hp: number, name: string }>} */
+  /** @type {Map<string, { root, nameSprite, body, targetPos, targetRotY, targetCrouch, targetLean, hp, name, kills, deaths, lastUpdate }>} */
   const remotePlayers = new Map();
 
   function makeNameSprite(name) {
@@ -44,7 +109,7 @@ export function createNetworkSystem(deps) {
     ctx.fillText(name, canvas.width / 2, canvas.height / 2);
     const tex = new THREE.CanvasTexture(canvas);
     tex.colorSpace = THREE.SRGBColorSpace;
-    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true }));
     sprite.scale.set(1.6, 0.4, 1);
     sprite.position.y = 2.2;
     return sprite;
@@ -57,7 +122,7 @@ export function createNetworkSystem(deps) {
     const bodyMat = new THREE.MeshStandardMaterial({
       color: 0x3388ff,
       roughness: 0.6,
-      side: THREE.DoubleSide, // visible even if the local camera ends up inside it
+      side: THREE.DoubleSide,
       emissive: 0x1144aa,
       emissiveIntensity: 0.3,
     });
@@ -68,24 +133,59 @@ export function createNetworkSystem(deps) {
     body.userData.remotePlayerId = id;
     root.add(body);
 
+    // Separate head hitbox, tagged distinctly so raycasts can tell a
+    // headshot apart from a body hit.
+    const headGeo = new THREE.SphereGeometry(0.22, 10, 10);
+    const headMat = new THREE.MeshStandardMaterial({
+      color: 0x3388ff, roughness: 0.6, side: THREE.DoubleSide,
+      emissive: 0x1144aa, emissiveIntensity: 0.3,
+    });
+    const head = new THREE.Mesh(headGeo, headMat);
+    head.position.y = eyeHeight - 0.15;
+    head.userData.isRemotePlayer = true;
+    head.userData.remotePlayerId = id;
+    head.userData.isHeadshot = true;
+    root.add(head);
+
     const nameSprite = makeNameSprite(name);
     root.add(nameSprite);
 
     scene.add(root);
-    return { root, nameSprite };
+    return { root, nameSprite, body, head };
   }
 
-  function addRemotePlayer(id, name, pos, rotY, hp) {
-    if (remotePlayers.has(id)) return;
-    const { root, nameSprite } = makeRemotePlayerMesh(name, id);
-    root.position.set(pos[0], pos[1] - eyeHeight, pos[2]);
-    remotePlayers.set(id, {
-      root, nameSprite,
-      targetPos: new THREE.Vector3(pos[0], pos[1] - eyeHeight, pos[2]),
-      targetRotY: rotY,
-      hp, name,
-    });
-    console.log(`[net] spawned remote player "${name}" (${id}) at`, pos);
+  function addOrUpdateRemotePlayer(id, data) {
+    if (id === uid || !data) return;
+    const pos = data.pos || [50, eyeHeight, 0];
+    const feetY = pos[1] - eyeHeight;
+
+    if (!remotePlayers.has(id)) {
+      const { root, nameSprite, body, head } = makeRemotePlayerMesh(data.name || 'Player', id);
+      root.position.set(pos[0], feetY, pos[2]);
+      remotePlayers.set(id, {
+        root, nameSprite, body, head,
+        targetPos: new THREE.Vector3(pos[0], feetY, pos[2]),
+        targetRotY: data.rotY || 0,
+        targetCrouch: data.crouch ? 1 : 0,
+        targetLean: data.lean || 0,
+        targetScale: data.scale || 1,
+        hp: data.hp, name: data.name,
+        kills: data.kills || 0, deaths: data.deaths || 0,
+        lastUpdate: Date.now(),
+      });
+      console.log(`[net] spawned remote player "${data.name}" (${id})`);
+    } else {
+      const rp = remotePlayers.get(id);
+      rp.targetPos.set(pos[0], feetY, pos[2]);
+      rp.targetRotY = data.rotY || 0;
+      rp.targetCrouch = data.crouch ? 1 : 0;
+      rp.targetLean = data.lean || 0;
+      rp.targetScale = data.scale || 1;
+      rp.hp = data.hp;
+      rp.kills = data.kills || 0;
+      rp.deaths = data.deaths || 0;
+      rp.lastUpdate = Date.now();
+    }
   }
 
   function removeRemotePlayer(id) {
@@ -100,133 +200,141 @@ export function createNetworkSystem(deps) {
     remotePlayers.delete(id);
   }
 
-  function applySnapshot(list) {
-    const seen = new Set();
-    for (const p of list) {
-      if (p.id === myId) continue;
-      seen.add(p.id);
-      if (!remotePlayers.has(p.id)) {
-        addRemotePlayer(p.id, p.name, p.pos, p.rotY, p.hp);
-      } else {
-        const rp = remotePlayers.get(p.id);
-        rp.targetPos.set(p.pos[0], p.pos[1] - eyeHeight, p.pos[2]);
-        rp.targetRotY = p.rotY;
-        rp.hp = p.hp;
-      }
-    }
-    // Clean up anyone in our local map who dropped out of the last snapshot
-    for (const id of remotePlayers.keys()) {
-      if (!seen.has(id)) removeRemotePlayer(id);
-    }
-  }
+  let myKills = 0, myDeaths = 0;
 
-  function connect() {
-    console.log(`[net] connecting to ${serverUrl} ...`);
-    
-    try {
-      ws = new WebSocket(serverUrl);
-    } catch (err) {
-      console.error('[net] Security Error creating WebSocket connection:', err);
-      console.error('[net] If your frontend runs on HTTPS, browsers block insecure "ws://" setups. Use "wss://" or run locally on HTTP.');
-      alert("Browser Permission Blocked!\n\nYou cannot connect to an insecure 'ws://' endpoint from an HTTPS webpage. Try launching your frontend on http://localhost or configure an encrypted 'wss://' server connection.");
-      connected = false;
-      return; 
-    }
+  async function connect() {
+    console.log(`[net] connecting to room "${room}" as ${playerName} (${uid})...`);
 
-    ws.addEventListener('open', () => {
-      console.log('[net] socket open, joining as', playerName);
-      ws.send(JSON.stringify({ type: 'join', name: playerName }));
+    await set(myPlayerRef, {
+      name: playerName,
+      pos: [50, eyeHeight, 0],
+      rotY: 0, crouch: false, lean: 0,
+      weaponIndex: 0,
+      hp: 150,
+      kills: 0, deaths: 0,
+      updatedAt: serverTimestamp(),
     });
+    onDisconnect(myPlayerRef).remove();
 
-    ws.addEventListener('message', (ev) => {
-      let msg;
-      try { msg = JSON.parse(ev.data); } catch { return; }
+    connected = true;
+    console.log(`[net] connected`);
 
-      switch (msg.type) {
-        case 'welcome':
-          myId = msg.id;
-          connected = true;
-          for (const p of msg.players) addRemotePlayer(p.id, p.name, p.pos, p.rotY, p.hp);
-          console.log(`[net] connected as ${myId}`);
-          break;
-        case 'snapshot':
-          applySnapshot(msg.players);
-          break;
-        case 'playerJoined':
-          console.log(`[net] ${msg.name} joined`);
-          break;
-        case 'playerLeft':
-          removeRemotePlayer(msg.id);
-          break;
-        case 'shoot':
-          if (onRemoteShot) onRemoteShot(msg.id, msg.origin, msg.dir, msg.weaponIndex);
-          break;
-        case 'hit':
-          if (msg.targetId === myId && onLocalPlayerHit) onLocalPlayerHit(msg.from, msg.damage);
-          break;
+    onValue(ref(db, `players/${room}`), (snapshot) => {
+      const all = snapshot.val() || {};
+      const seen = new Set();
+      for (const [id, data] of Object.entries(all)) {
+        if (id === uid) continue;
+        seen.add(id);
+        addOrUpdateRemotePlayer(id, data);
+      }
+      for (const id of remotePlayers.keys()) {
+        if (!seen.has(id)) removeRemotePlayer(id);
       }
     });
 
-    ws.addEventListener('close', () => {
-      connected = false;
-      console.log('[net] disconnected, retrying in 3s...');
-      setTimeout(connect, 3000);
-    });
+    onChildAdded(eventsRef, (snapshot) => {
+      const key = snapshot.key;
+      const evt = snapshot.val();
+      if (!evt || seenEventKeys.has(key)) return;
+      seenEventKeys.add(key);
 
-    ws.addEventListener('error', (e) => { console.error('[net] socket error', e); });
+      if (evt.type === 'shoot' && evt.from !== uid) {
+        if (onRemoteShot) onRemoteShot(evt.from, evt.origin, evt.dir, evt.weaponIndex);
+      } else if (evt.type === 'hit' && evt.targetId === uid) {
+        if (onLocalPlayerHit) onLocalPlayerHit(evt.from, evt.fromName, evt.damage, evt.isHeadshot, evt.bodyEquivalentDamage);
+      } else if (evt.type === 'death') {
+        if (onKillFeed) onKillFeed(evt.killerName, evt.victimName);
+      }
+
+      remove(ref(db, `events/${room}/${key}`)).catch(() => {});
+    });
   }
 
   connect();
 
-  // IMPORTANT: this runs on a real timer, not requestAnimationFrame.
   setInterval(() => {
     if (!connected || !latestLocalState) return;
-    ws.send(JSON.stringify({ type: 'state', ...latestLocalState }));
+    update(myPlayerRef, { ...latestLocalState, updatedAt: serverTimestamp() }).catch(() => {});
   }, 1000 / STATE_SEND_HZ);
 
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, rp] of remotePlayers) {
+      if (now - rp.lastUpdate > STALE_PLAYER_MS) removeRemotePlayer(id);
+    }
+  }, 3000);
+
   return {
-    /** Call once per frame from animate(). Records local state (sent on its own timer) and interpolates remote players. */
-    update(delta, playerPos, cameraRotY, weaponIndex, hp) {
+    update(delta, playerPos, cameraRotY, weaponIndex, hp, crouching, leanAmt, scale) {
       latestLocalState = {
         pos: [playerPos.x, playerPos.y, playerPos.z],
         rotY: cameraRotY,
+        crouch: !!crouching,
+        lean: leanAmt || 0,
+        scale: scale || 1,
         weaponIndex,
         hp,
+        kills: myKills,
+        deaths: myDeaths,
       };
 
       const t = Math.min(1, delta * INTERP_SPEED);
       for (const rp of remotePlayers.values()) {
         rp.root.position.lerp(rp.targetPos, t);
         rp.root.rotation.y = THREE.MathUtils.lerp(rp.root.rotation.y, rp.targetRotY, t);
+        rp.root.rotation.z = THREE.MathUtils.lerp(rp.root.rotation.z, rp.targetLean, t);
+
+        const currentScale = rp.root.scale.x;
+        const newScale = THREE.MathUtils.lerp(currentScale, rp.targetScale, t);
+        rp.root.scale.setScalar(newScale);
+
+        const targetBodyScaleY = rp.targetCrouch ? 0.72 : 1.0;
+        rp.body.scale.y = THREE.MathUtils.lerp(rp.body.scale.y, targetBodyScaleY, t);
+        const heightDrop = (1.0 - rp.body.scale.y) * eyeHeight * 0.5;
+        rp.nameSprite.position.y = 2.2 - heightDrop;
       }
     },
 
-    /** Call when the local player fires, so others see it. */
     sendShoot(originVec3, dirVec3, weaponIndex) {
       if (!connected) return;
-      ws.send(JSON.stringify({
+      push(eventsRef, {
         type: 'shoot',
+        from: uid,
         origin: [originVec3.x, originVec3.y, originVec3.z],
         dir: [dirVec3.x, dirVec3.y, dirVec3.z],
         weaponIndex,
-      }));
+      }).catch(() => {});
     },
 
-    /** Call when the local player's raycast hits a known remote player's hitbox. */
-    sendHit(targetId, damage) {
+    sendHit(targetId, damage, isHeadshot, bodyEquivalentDamage) {
       if (!connected) return;
-      ws.send(JSON.stringify({ type: 'hit', targetId, damage }));
+      push(eventsRef, {
+        type: 'hit', from: uid, fromName: playerName, targetId, damage,
+        isHeadshot: !!isHeadshot,
+        bodyEquivalentDamage: (typeof bodyEquivalentDamage === 'number') ? bodyEquivalentDamage : damage,
+      }).catch(() => {});
     },
 
-    /** Returns [ [id, {root, targetPos, ...}], ... ] so main.js can raycast against remote hitboxes if desired. */
+    /** Call when the LOCAL player dies, naming who killed them (or null if environmental/unknown). */
+    sendDeath(killerName) {
+      myDeaths++;
+      if (!connected) return;
+      push(eventsRef, { type: 'death', killerName: killerName || 'the environment', victimName: playerName }).catch(() => {});
+    },
+
+    /** Call when the local player's shot kills someone else, for the local kill counter. */
+    registerLocalKill() {
+      myKills++;
+    },
+
     getRemotePlayers() { return remotePlayers; },
-
-    /** Flat array of the actual mesh objects to hand to raycaster.intersectObjects(). */
-    getRemotePlayerMeshes() {
-      return [...remotePlayers.values()].map(rp => rp.root);
+    getRemotePlayerMeshes() { return [...remotePlayers.values()].map(rp => rp.root); },
+    getScoreboard() {
+      const rows = [...remotePlayers.entries()].map(([id, rp]) => ({ uid: id, name: rp.name, kills: rp.kills, deaths: rp.deaths }));
+      rows.push({ uid: null, name: playerName + ' (you)', kills: myKills, deaths: myDeaths });
+      return rows.sort((a, b) => b.kills - a.kills);
     },
-
     isConnected() { return connected; },
-    getMyId() { return myId; },
+    getMyId() { return uid; },
   };
 }
