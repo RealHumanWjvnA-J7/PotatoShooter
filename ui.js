@@ -1,123 +1,253 @@
 import * as THREE from 'three';
 
-export class TargetCube {
-  constructor(scene) {
-    this.scene = scene;
-    this.damageHistory = [];
-    this.size = { w: 2, h: 2, d: 2 };
+export function createCircleTexture(size, blurRadius = 0) {
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  const center = size / 2;
 
-    // 1. Create the Cube Mesh
-    const geometry = new THREE.BoxGeometry(1, 1, 1);
-    const material = new THREE.MeshStandardMaterial({ 
-      color: 0xff3b30, // Bright target red
-      roughness: 0.3,
-      metalness: 0.1
+  ctx.clearRect(0, 0, size, size);
+  if (blurRadius > 0) {
+    ctx.filter = `blur(${blurRadius}px)`;
+  }
+  ctx.beginPath();
+  ctx.arc(center, center, center - blurRadius - 2, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+/**
+ * @param {object} deps
+ * @param {THREE.Scene} deps.scene
+ * @param {THREE.DirectionalLight} deps.sun
+ * @param {THREE.WebGLRenderer} deps.renderer
+ * @param {object} deps.settings - mutated in place, same object main.js reads elsewhere
+ * @param {object} deps.GRAPHICS_PROFILES
+ * @param {number[]} deps.ANTI_ALIASING_TIERS
+ * @param {() => THREE.Object3D[]} deps.getCollidables - getter, not a static array, since main.js reassigns `collidables` when the map loads
+ * @param {THREE.Object3D[]} deps.activeTracers - mutated in place (push/splice), safe to pass directly
+ * @param {{ isLocked: boolean, lock: () => void, unlock: () => void }} deps.controls
+ */
+export function createUISystem(deps) {
+  const { scene, sun, renderer, settings, GRAPHICS_PROFILES, ANTI_ALIASING_TIERS, getCollidables, activeTracers, controls } = deps;
+
+  // VISUAL SUN & DYNAMIC BLOOM SYSTEM
+  const sunGroup = new THREE.Group();
+  scene.add(sunGroup);
+
+  const sunCoreMat = new THREE.SpriteMaterial({
+    map: createCircleTexture(128, 0),
+    color: 0xffffff,
+    fog: false
+  });
+  const sunCoreSprite = new THREE.Sprite(sunCoreMat);
+  sunCoreSprite.scale.set(12, 12, 1);
+  sunGroup.add(sunCoreSprite);
+
+  let sunGlowSprite = null;
+
+  function applyGraphicsSettings() {
+    const p = GRAPHICS_PROFILES[settings.graphics];
+    const bloomContainer = document.getElementById('bloom-option-container');
+
+    if (bloomContainer) bloomContainer.style.display = p.bloom ? 'block' : 'none';
+
+    if (!p.shadows) {
+      sun.castShadow = false;
+    } else {
+      sun.castShadow = true;
+
+      let frustumSize = 35;
+      if (settings.graphics === 'LOW')    frustumSize = 25;
+      if (settings.graphics === 'MEDIUM') frustumSize = 45;
+      if (settings.graphics === 'HIGH')   frustumSize = 60;
+      if (settings.graphics === 'ULTRA')  frustumSize = 75;
+      if (settings.graphics === 'INSANE') frustumSize = 90;
+
+      sun.shadow.mapSize.width = p.shadowRes;
+      sun.shadow.mapSize.height = p.shadowRes;
+      sun.shadow.camera.near = 1.0;
+      sun.shadow.camera.far = 200;
+
+      sun.shadow.camera.left = -frustumSize;
+      sun.shadow.camera.right = frustumSize;
+      sun.shadow.camera.top = frustumSize;
+      sun.shadow.camera.bottom = -frustumSize;
+
+      if (sun.shadow.map) {
+        sun.shadow.map.dispose();
+        sun.shadow.map = null;
+      }
+      sun.shadow.camera.updateProjectionMatrix();
+    }
+
+    const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
+    const targetedAnisotropy = Math.min(p.anisotropy, maxAnisotropy);
+
+    scene.traverse((obj) => {
+      if (obj.isMesh) {
+        obj.castShadow = p.shadows;
+        obj.receiveShadow = p.shadows;
+
+        if (obj.material) {
+          const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+          mats.forEach(mat => {
+            if (mat.map && mat.map.isTexture) {
+              mat.map.anisotropy = targetedAnisotropy;
+              mat.map.needsUpdate = true;
+            }
+            mat.needsUpdate = true;
+          });
+        }
+      }
     });
-    this.mesh = new THREE.Mesh(geometry, material);
-    this.mesh.castShadow = true;
-    this.mesh.receiveShadow = true;
-    
-    // Attach markers so main.js can identify this specific object during raycasting
-    this.mesh.userData.isTargetCube = true;
-    this.mesh.userData.parentInstance = this;
 
-    this.scene.add(this.mesh);
+    if (sunGlowSprite) {
+      sunGroup.remove(sunGlowSprite);
+      sunGlowSprite.material.map.dispose();
+      sunGlowSprite.material.dispose();
+      sunGlowSprite = null;
+    }
 
-    // 2. Create an Overhead Dynamic Canvas Text Display
-    this.canvas = document.createElement('canvas');
-    this.canvas.width = 512;
-    this.canvas.height = 128;
-    this.ctx = this.canvas.getContext('2d');
-
-    this.texture = new THREE.CanvasTexture(this.canvas);
-    this.texture.colorSpace = THREE.SRGBColorSpace;
-    
-    const spriteMaterial = new THREE.SpriteMaterial({ map: this.texture, transparent: true });
-    this.textSprite = new THREE.Sprite(spriteMaterial);
-    this.textSprite.scale.set(4, 1, 1); // Maintain a clean text aspect ratio banner
-
-    this.scene.add(this.textSprite);
-
-    // Initial default positions & sizes (completely adjustable via code below)
-    this.setSize(1, 3, 1);
-    this.setPosition(60, 1.5, -5);
-    this.updateText(0);
+    if (p.bloom && settings.bloomEnabled) {
+      const blurRadius = Math.max(4, Math.floor(p.bloomSize * 0.15));
+      const glowTex = createCircleTexture(p.bloomSize, blurRadius);
+      const glowMat = new THREE.SpriteMaterial({
+        map: glowTex,
+        color: 0xffddaa,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        fog: false
+      });
+      sunGlowSprite = new THREE.Sprite(glowMat);
+      sunGlowSprite.scale.set(30, 30, 1);
+      sunGroup.add(sunGlowSprite);
+    }
   }
 
-  /**
-   * Code-Controlled Movement API
-   */
-  setPosition(x, y, z) {
-    this.mesh.position.set(x, y, z);
-    // Locks the text display precisely above the target's upper bounds
-    this.textSprite.position.set(x, y + (this.size.h / 2) + 0.9, z);
+  function toggleMenu() {
+    const menu = document.getElementById('game-menu');
+    if (menu.style.display === 'none') {
+      menu.style.display = 'block';
+      controls.unlock();
+    } else {
+      menu.style.display = 'none';
+      controls.lock();
+    }
   }
 
-  /**
-   * Code-Controlled Size Adjustment API
-   */
-  setSize(w, h, d) {
-    this.size = { w, h, d };
-    this.mesh.scale.set(w, h, d);
-    // Shift text alignment higher to account for scaling modifications
-    this.textSprite.position.y = this.mesh.position.y + (h / 2) + 0.9;
-  }
+  function buildUI() {
+    const menuHTML = `
+      <div id="game-menu" style="display:none; position:absolute; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); z-index:9999; color:white; font-family:monospace; padding:50px; box-sizing:border-box;">
+        <h1 style="color:#00ffcc;">GAME MENU</h1>
+        <button id="btn-resume" style="padding:10px 20px; font-size:16px; margin-bottom:20px; cursor:pointer;">Resume</button>
 
-  /**
-   * Registers a fresh hit instance
-   */
-  takeDamage(amount) {
-    this.damageHistory.push({
-      amount: amount,
-      timestamp: performance.now()
+        <h2>Options</h2>
+        <div style="margin-bottom:10px;">
+          <label>Debug Tracers:</label>
+          <button id="btn-tracers">OFF</button>
+        </div>
+        <div style="margin-bottom:10px;">
+          <label>Wireframe:</label>
+          <button id="btn-wireframe">OFF</button>
+        </div>
+        <div style="margin-bottom:10px;">
+          <label>Collision Capsule Mesh Visible:</label>
+          <button id="btn-visible-player">OFF</button>
+        </div>
+        <div style="margin-bottom:10px;">
+          <label>Graphics Quality:</label>
+          <button id="btn-graphics">MEDIUM</button>
+        </div>
+        <div style="margin-bottom:10px;">
+          <label>Anti-Aliasing (MSAA Samples - Note: Handled natively now):</label>
+          <button id="btn-aa">4x</button>
+        </div>
+        <div id="bloom-option-container" style="margin-bottom:10px; display:none;">
+          <label>Toggle Bloom:</label>
+          <button id="btn-bloom">ON</button>
+        </div>
+        <div style="margin-bottom:10px;">
+          <label>Camera Bob Intensity (0.00 - 2.00): <span id="bob-val">0.60</span></label><br>
+          <input type="range" id="slider-bob" min="0" max="2" step="0.05" value="0.6" style="width:200px;">
+        </div>
+      </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', menuHTML);
+
+    const btnResume = document.getElementById('btn-resume');
+    const btnTracers = document.getElementById('btn-tracers');
+    const btnWireframe = document.getElementById('btn-wireframe');
+    const btnVisiblePlayer = document.getElementById('btn-visible-player');
+    const btnGraphics = document.getElementById('btn-graphics');
+    const btnAA = document.getElementById('btn-aa');
+    const btnBloom = document.getElementById('btn-bloom');
+    const sliderBob = document.getElementById('slider-bob');
+    const bobVal = document.getElementById('bob-val');
+
+    btnResume.addEventListener('click', toggleMenu);
+
+    btnTracers.addEventListener('click', () => {
+      settings.debugTracers = !settings.debugTracers;
+      btnTracers.textContent = settings.debugTracers ? 'ON' : 'OFF';
+      if (!settings.debugTracers) {
+        while (activeTracers.length > 0) {
+          const t = activeTracers.pop();
+          scene.remove(t.mesh);
+        }
+      }
     });
+
+    btnWireframe.addEventListener('click', () => {
+      settings.wireframe = !settings.wireframe;
+      btnWireframe.textContent = settings.wireframe ? 'ON' : 'OFF';
+      getCollidables().forEach(obj => {
+        if (obj.material) obj.material.wireframe = settings.wireframe;
+      });
+    });
+
+    btnVisiblePlayer.addEventListener('click', () => {
+      settings.visiblePlayer = !settings.visiblePlayer;
+      btnVisiblePlayer.textContent = settings.visiblePlayer ? 'ON' : 'OFF';
+    });
+
+    const graphicsLevels = Object.keys(GRAPHICS_PROFILES);
+    btnGraphics.addEventListener('click', () => {
+      let idx = graphicsLevels.indexOf(settings.graphics);
+      idx = (idx + 1) % graphicsLevels.length;
+      settings.graphics = graphicsLevels[idx];
+      btnGraphics.textContent = settings.graphics;
+      applyGraphicsSettings();
+    });
+
+    btnAA.addEventListener('click', () => {
+      let idx = ANTI_ALIASING_TIERS.indexOf(settings.msaaSamples);
+      idx = (idx + 1) % ANTI_ALIASING_TIERS.length;
+      settings.msaaSamples = ANTI_ALIASING_TIERS[idx];
+      btnAA.textContent = settings.msaaSamples === 0 ? 'OFF' : `${settings.msaaSamples}x`;
+    });
+
+    btnBloom.addEventListener('click', () => {
+      settings.bloomEnabled = !settings.bloomEnabled;
+      btnBloom.textContent = settings.bloomEnabled ? 'ON' : 'OFF';
+      applyGraphicsSettings();
+    });
+
+    sliderBob.addEventListener('input', (e) => {
+      settings.bobIntensity = parseFloat(e.target.value);
+      bobVal.textContent = settings.bobIntensity.toFixed(2);
+    });
+
+    btnAA.textContent = `${settings.msaaSamples}x`;
   }
 
-  /**
-   * Evaluates rolling history window & updates display
-   */
-  update() {
-    const now = performance.now();
-    
-    // Purge records older than 5000 milliseconds (5 seconds)
-    this.damageHistory = this.damageHistory.filter(hit => now - hit.timestamp <= 5000);
+  buildUI();
 
-    // Accumulate valid rolling damage
-    const totalRecentDamage = this.damageHistory.reduce((sum, hit) => sum + hit.amount, 0);
-
-    // Draw the new score back to the canvas texture map
-    this.updateText(totalRecentDamage);
-  }
-
-  updateText(damageValue) {
-    const ctx = this.ctx;
-    ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-
-    // Render transparent pill background for contrast matching
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
-    ctx.beginPath();
-    ctx.roundRect(16, 16, this.canvas.width - 32, this.canvas.height - 32, 24);
-    ctx.fill();
-
-    // Render text typography metrics
-    ctx.font = 'bold 42px sans-serif';
-    ctx.fillStyle = damageValue > 0 ? '#ffcc00' : '#ffffff'; // Blinks yellow when receiving heat
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(`Damage (Past 5s): ${damageValue}`, this.canvas.width / 2, this.canvas.height / 2);
-
-    this.texture.needsUpdate = true;
-  }
-
-  /**
-   * Housekeeping disposal helper
-   */
-  destroy() {
-    this.scene.remove(this.mesh);
-    this.scene.remove(this.textSprite);
-    this.mesh.geometry.dispose();
-    this.mesh.material.dispose();
-    this.texture.dispose();
-    this.textSprite.material.dispose();
-  }
+  return { toggleMenu, applyGraphicsSettings, sunGroup };
 }
