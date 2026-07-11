@@ -5,20 +5,16 @@ import {
   MAP_FILE, MAP_SCALE, DEFAULT_TARGET_LENGTH, DEFAULT_SCALE_MULTIPLIER,
   ANIM_NAMES, NORMAL_FOV, FAKE_SCOPE_FOV, MAX_BULLET_HOLES, WEAPON_CONFIGS,
   MAX_HP, GRAPHICS_PROFILES, ANTI_ALIASING_TIERS,
-  HP_REGEN_DELAY, HP_REGEN_RATE, RESPAWN_DELAY, SPAWN_POINTS,
   MOVE_SPEED, SPRINT_MULTIPLIER, CROUCH_SPEED_MULTIPLIER, JUMP_SPEED, GRAVITY,
   STAND_HEIGHT, CROUCH_HEIGHT, PLAYER_RADIUS, LEAN_ANGLE, LEAN_OFFSET,
-  BOB_SMOOTHING, BOB_PROFILES, ROOMS,
+  BOB_SMOOTHING, BOB_PROFILES,
 } from './config.js';
 import { createUISystem } from './ui.js';
 import { TargetCube } from './targetCube.js'; // IMPORTED TARGET CUBE
-import { createNetworkSystem, loginOrSignUp, fetchRoomCounts, banPlayer } from './network.js';
+import { createNetworkSystem } from './network.js';
 
 // ENGINE SETTINGS
 let playerHp = 150;
-let isDead = false;
-let lastDamageTime = -Infinity; // seconds, from performance.now()/1000
-let respawnAt = 0;              // seconds, from performance.now()/1000
 
 const settings = {
   debugTracers: false,
@@ -30,10 +26,7 @@ const settings = {
   bobIntensity: 2
 };
 
-let network = null; // set up once the player picks a room on the connect overlay
-let isAdmin = false;
-let myUid = null;
-let myDisplayName = 'Player';
+let network = null; // set up once the player clicks PLAY on the connect overlay
 
 let noclip = false;
 let freecam = false;
@@ -118,7 +111,7 @@ scene.add(playerHitbox);
 const activeTracers = [];
 const controls = new PointerLockControls(cameraGroup, document.body);
 
-const { toggleMenu, applyGraphicsSettings, sunGroup, updateScoreboard, setAdminMode } = createUISystem({
+const { toggleMenu, applyGraphicsSettings, sunGroup } = createUISystem({
   scene, sun, renderer, settings, GRAPHICS_PROFILES, ANTI_ALIASING_TIERS,
   getCollidables: () => collidables,
   activeTracers,
@@ -335,10 +328,9 @@ function loadWeaponAssets(index) {
       
       w.loaded = true;
       updateHud();
-      reportAssetLoaded();
     },
     undefined,
-    (err) => { console.error(`Failed to load weapon:`, err); updateHud(); reportAssetLoaded(); }
+    (err) => { console.error(`Failed to load weapon:`, err); updateHud(); }
   );
 }
 
@@ -363,12 +355,10 @@ function loadMap(path) {
       collidables.push(myTarget.mesh);
       
       applyGraphicsSettings();
-      reportAssetLoaded();
     },
     undefined,
     (err) => { 
       collidables = [fallbackGround, myTarget.mesh]; 
-      reportAssetLoaded();
     }
   );
 }
@@ -394,13 +384,6 @@ function updateHud() {
   let lines = [`HP: ${Math.floor(playerHp)} / ${MAX_HP}`];
   if (noclip) lines[0] += " | [NOCLIP]";
   if (freecam) lines[0] += " | [FREECAM]";
-
-  if (isDead) {
-    const secsLeft = Math.max(0, Math.ceil(respawnAt - performance.now() / 1000));
-    lines = [`YOU DIED - respawning in ${secsLeft}...`];
-    setHud(lines);
-    return;
-  }
 
   lines.push(WEAPON_CONFIGS.map((cfg, i) => {
     const tag = weapons[i].loaded ? cfg.name : `${cfg.name} (missing)`;
@@ -513,17 +496,11 @@ function raycastHit(offsetX = 0, offsetY = 0) {
   _scratchVec2D.set(offsetX, offsetY);
   raycaster.setFromCamera(_scratchVec2D, camera);
 
-  const hits = raycaster.intersectObjects(collidables, true);
-  const wallDist = hits.length ? hits[0].distance : Infinity;
-
-  // Check remote players too, since they're not part of `collidables`.
-  // Only counts as a hit if it's actually closer than the nearest wall -
-  // otherwise you'd be shooting someone through solid geometry.
   if (network) {
     const remoteMeshes = network.getRemotePlayerMeshes();
     if (remoteMeshes.length > 0) {
       const playerHits = raycaster.intersectObjects(remoteMeshes, true);
-      if (playerHits.length > 0 && playerHits[0].distance < wallDist) {
+      if (playerHits.length > 0) {
         const hitId = playerHits[0].object.userData.remotePlayerId;
         if (hitId) {
           const dmg = W().cfg.damage || 25;
@@ -533,10 +510,11 @@ function raycastHit(offsetX = 0, offsetY = 0) {
     }
   }
 
+  const hits = raycaster.intersectObjects(collidables, true);
+  
   if (hits.length) {
     const hit = hits[0];
     
-    // RAYCAST DAMAGE PROCESSING BLOCK
     if (hit.object.userData.isTargetCube) {
       const dmg = W().cfg.damage || 25; 
       hit.object.userData.parentInstance.takeDamage(dmg);
@@ -580,12 +558,8 @@ document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Tab') { e.preventDefault(); toggleMenu(); return; }
-  if (!isAdmin) {
-    if (e.code === 'BracketLeft' || e.code === 'BracketRight') return; // debug tools, admin only
-  } else {
-    if (e.code === 'BracketLeft') { noclip = !noclip; if (noclip) { verticalVelocity = 0; grounded = true; } updateHud(); return; }
-    if (e.code === 'BracketRight') { freecam = !freecam; if (freecam) freecamPos.copy(cameraGroup.position); updateHud(); return; }
-  }
+  if (e.code === 'BracketLeft') { noclip = !noclip; if (noclip) { verticalVelocity = 0; grounded = true; } updateHud(); return; }
+  if (e.code === 'BracketRight') { freecam = !freecam; if (freecam) freecamPos.copy(cameraGroup.position); updateHud(); return; }
 
   if (!controls.isLocked) return;
   switch (e.code) {
@@ -625,53 +599,6 @@ window.addEventListener('resize', () => {
   viewmodelCamera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
-
-// -----------------------------
-// DAMAGE FEEDBACK / KILL FEED
-// -----------------------------
-const damageVignette = document.getElementById('damage-vignette');
-function flashDamage(amount) {
-  const intensity = Math.min(1, amount / 40); // scales with hit size, caps out
-  damageVignette.style.boxShadow = `inset 0 0 ${80 + intensity * 60}px ${20 + intensity * 20}px rgba(255,0,0,${0.35 + intensity * 0.35})`;
-  clearTimeout(flashDamage._t);
-  flashDamage._t = setTimeout(() => { damageVignette.style.boxShadow = 'inset 0 0 0 0 rgba(255,0,0,0)'; }, 220);
-}
-
-const killFeedEl = document.getElementById('kill-feed');
-function pushKillFeed(text) {
-  const line = document.createElement('div');
-  line.textContent = text;
-  killFeedEl.appendChild(line);
-  setTimeout(() => { line.style.opacity = '0'; }, 4000);
-  setTimeout(() => { line.remove(); }, 6000);
-  while (killFeedEl.children.length > 5) killFeedEl.removeChild(killFeedEl.firstChild);
-}
-
-// -----------------------------
-// HP / DEATH / RESPAWN
-// -----------------------------
-function die(killerName = null) {
-  if (isDead) return;
-  isDead = true;
-  playerHp = 0;
-  respawnAt = performance.now() / 1000 + RESPAWN_DELAY;
-  leftMouseDown = false;
-  if (controls.isLocked) controls.unlock();
-  if (network) network.sendDeath(killerName);
-  updateHud();
-}
-
-function respawn() {
-  const spawn = SPAWN_POINTS[Math.floor(Math.random() * SPAWN_POINTS.length)];
-  playerPos.set(spawn[0], spawn[1], spawn[2]);
-  cameraGroup.position.copy(playerPos);
-  verticalVelocity = 0;
-  grounded = true;
-  playerHp = MAX_HP;
-  isDead = false;
-  lastDamageTime = performance.now() / 1000;
-  updateHud();
-}
 
 // PHYSICS & MOVEMENT
 function groundHeightAt(x, z, camY) {
@@ -795,26 +722,15 @@ function movePlayer(delta) {
   sunGroup.position.set(playerPos.x + 450, playerPos.y + 750, playerPos.z + 250);
 }
 
-let scoreboardRefreshTimer = 0;
-
 // MAIN LOOP & OFFSETS
 function animate() {
   requestAnimationFrame(animate);
   const delta = Math.min(clock.getDelta(), 0.1); 
 
-  // TICK THE TARGET TRACKER
   myTarget.update();
 
-  if (isDead) {
-    if (performance.now() / 1000 >= respawnAt) respawn();
-    updateHud();
-  } else if (playerHp < MAX_HP && (performance.now() / 1000 - lastDamageTime) >= HP_REGEN_DELAY) {
-    playerHp = Math.min(MAX_HP, playerHp + HP_REGEN_RATE * delta);
-    updateHud();
-  }
-
   if (network) {
-    network.update(delta, playerPos, cameraGroup.rotation.y, currentIndex, playerHp, moveState.crouching, currentLean);
+    network.update(delta, playerPos, cameraGroup.rotation.y, currentIndex, playerHp);
   }
 
   if (controls.isLocked) {
@@ -855,17 +771,14 @@ function animate() {
   recoilX = THREE.MathUtils.lerp(recoilX, targetRecoilX, delta * 20);
   recoilY = THREE.MathUtils.lerp(recoilY, targetRecoilY, delta * 20);
 
-  // 1. Primary physical camera modifications (World Layer Viewport)
   camera.position.set(leanOffsetAmt + bobHoriz, bobVert, 0);
   camera.rotation.set(recoilX, recoilY, currentLean, 'YXZ');
 
-  // FIXED: Keep the viewmodel overlay camera cleanly isolated at the origin.
   viewmodelCamera.position.set(0, 0, 0);
   viewmodelCamera.rotation.set(0, 0, 0);
 
   const adsModifier = scoped ? 0.0 : 1.0; 
 
-  // 2. Viewmodel Position Secondary Offsets (Sway lag, movement inertias, recoil kick)
   let vmX = -swayX * 0.4 * adsModifier;       
   let vmY = swayY * 0.4 * adsModifier;
   let vmZ = recoilX * -0.3; 
@@ -876,7 +789,6 @@ function animate() {
 
   weaponRig.position.set(vmX, vmY, vmZ);
 
-  // 3. Viewmodel Rotation Secondary Offsets (Sway twisting, weapon shooting snaps, procedural lean)
   let rotX = swayY * 0.12 * adsModifier;      
   let rotY = -swayX * 0.12 * adsModifier;
   let rotZ = currentLean * 1.0 * adsModifier;                   
@@ -920,20 +832,6 @@ function animate() {
 
   playerHitbox.visible = settings.visiblePlayer;
 
-  const gameMenuEl = document.getElementById('game-menu');
-  if (gameMenuEl && gameMenuEl.style.display !== 'none') {
-    scoreboardRefreshTimer += delta;
-    if (scoreboardRefreshTimer >= 0.5) {
-      scoreboardRefreshTimer = 0;
-      const rows = network ? network.getScoreboard() : [];
-      updateScoreboard(rows, isAdmin, (targetUid) => {
-        if (confirm('Ban this player? They will be blocked from logging in again.')) {
-          banPlayer(targetUid).catch((err) => alert('Ban failed: ' + err.message));
-        }
-      });
-    }
-  }
-
   sunGroup.children.forEach(sprite => {
     sprite.lookAt(cameraGroup.position);
   });
@@ -948,14 +846,11 @@ function animate() {
     }
   }
 
-  // OPTIMIZED: SINGLE-PASS DEPTH LAYERING (Eliminates Double Render)
   renderer.setRenderTarget(null);
   renderer.clear(true, true, true);
 
-  // Pass 1: Render the main world environment
   renderer.render(scene, camera);
 
-  // Pass 2: Isolate the weapon overlay depth layer to prevent clipping
   renderer.clearDepth();
   renderer.render(viewmodelScene, viewmodelCamera);
 }
@@ -975,29 +870,20 @@ function drawRemoteTracer(originArr, dirArr) {
   activeTracers.push({ mesh: line, life: 1, permanent: false });
 }
 
-function startNetwork(uid, playerName, room, adminFlag) {
-  myUid = uid;
-  myDisplayName = playerName;
-  isAdmin = adminFlag;
-  setAdminMode(isAdmin);
+function startNetwork(serverUrl, playerName) {
+  // Graceful browser-level check
+  if (window.location.protocol === 'https:' && serverUrl.startsWith('ws://')) {
+    console.warn("[net] Proactive Warning: Browsers typically block insecure ws:// connections on HTTPS setups.");
+  }
 
   network = createNetworkSystem({
     scene,
-    uid,
-    playerName,
-    room,
+    serverUrl,
+    playerName: playerName || 'Player',
     eyeHeight: STAND_HEIGHT,
-    onLocalPlayerHit: (fromId, fromName, damage) => {
-      if (isDead) return;
+    onLocalPlayerHit: (fromId, damage) => {
       playerHp = Math.max(0, playerHp - damage);
-      lastDamageTime = performance.now() / 1000;
-      flashDamage(damage);
-      if (playerHp <= 0) die(fromName);
       updateHud();
-    },
-    onKillFeed: (killerName, victimName) => {
-      pushKillFeed(`${killerName} killed ${victimName}`);
-      if (killerName === myDisplayName) network.registerLocalKill();
     },
     onRemoteShot: (id, origin, dir) => {
       drawRemoteTracer(origin, dir);
@@ -1006,94 +892,39 @@ function startNetwork(uid, playerName, room, adminFlag) {
 }
 
 const mpLogin = document.getElementById('mp-login');
-const authPanel = document.getElementById('mp-auth-panel');
-const roomPanel = document.getElementById('mp-room-panel');
-const tabLogin = document.getElementById('mp-tab-login');
-const tabSignup = document.getElementById('mp-tab-signup');
-const emailInput = document.getElementById('mp-email');
-const passwordInput = document.getElementById('mp-password');
-const authError = document.getElementById('mp-auth-error');
-const authSubmitBtn = document.getElementById('mp-auth-submit');
-const mpSoloBtn = document.getElementById('mp-solo-btn');
-const welcomeNameEl = document.getElementById('mp-welcome-name');
-const displayNameInput = document.getElementById('mp-display-name');
-const roomListEl = document.getElementById('mp-room-list');
+const mpConnectBtn = document.getElementById('mp-connect-btn');
 
-let authMode = 'login';
-tabLogin.addEventListener('click', () => {
-  authMode = 'login';
-  tabLogin.classList.add('active'); tabSignup.classList.remove('active');
-  authSubmitBtn.textContent = 'LOG IN';
-});
-tabSignup.addEventListener('click', () => {
-  authMode = 'signup';
-  tabSignup.classList.add('active'); tabLogin.classList.remove('active');
-  authSubmitBtn.textContent = 'SIGN UP';
-});
-
-let pendingUid = null, pendingIsAdmin = false;
-
-authSubmitBtn.addEventListener('click', async () => {
-  authError.textContent = '';
-  authSubmitBtn.disabled = true;
-  authSubmitBtn.textContent = 'Please wait...';
-  try {
-    const { uid, isAdmin: adminFlag } = await loginOrSignUp(emailInput.value.trim(), passwordInput.value, authMode);
-    pendingUid = uid;
-    pendingIsAdmin = adminFlag;
-    welcomeNameEl.textContent = emailInput.value.trim();
-    authPanel.style.display = 'none';
-    roomPanel.style.display = 'flex';
-    await populateRoomList();
-  } catch (err) {
-    authError.textContent = err.message || 'Something went wrong.';
-  } finally {
-    authSubmitBtn.disabled = false;
-    authSubmitBtn.textContent = authMode === 'login' ? 'LOG IN' : 'SIGN UP';
+mpConnectBtn.addEventListener('click', () => {
+  const name = document.getElementById('mp-name').value.trim() || 'Player';
+  const url = document.getElementById('mp-url').value.trim();
+  
+  if (url) {
+    startNetwork(url, name);
   }
-});
-
-async function populateRoomList() {
-  roomListEl.innerHTML = 'Loading server list...';
-  const counts = await fetchRoomCounts(ROOMS).catch(() => ({}));
-  roomListEl.innerHTML = '';
-  ROOMS.forEach((room) => {
-    const btn = document.createElement('button');
-    btn.className = 'room-btn';
-    const count = counts[room] ?? '?';
-    btn.innerHTML = `<span>${room}</span><span>${count} online</span>`;
-    btn.addEventListener('click', () => {
-      const name = displayNameInput.value.trim() || 'Player';
-      startNetwork(pendingUid, name, room, pendingIsAdmin);
-      mpLogin.style.display = 'none';
-    });
-    roomListEl.appendChild(btn);
-  });
-}
-
-mpSoloBtn.addEventListener('click', () => {
-  isAdmin = true; // solo/offline play - no one else around, debug tools are fine
-  setAdminMode(isAdmin);
+  
   mpLogin.style.display = 'none';
+  // Instantly dispatch direct user-interaction lock to capture pointer
+  setTimeout(() => { controls.lock(); }, 100);
 });
 
-// -----------------------------
-// LOADING SCREEN
-// -----------------------------
-const loadingScreen = document.getElementById('loading-screen');
-const loadingBar = document.getElementById('loading-bar');
-const TOTAL_ASSETS_TO_LOAD = WEAPON_CONFIGS.length + 1; // weapons + map
-let assetsLoaded = 0;
+// Programmatically build a "Play Offline" option to fix Single Player logic loops
+const spPlayBtn = document.createElement('button');
+spPlayBtn.id = 'sp-play-btn';
+spPlayBtn.textContent = 'Play Offline (Single Player)';
+spPlayBtn.style.cssText = 'margin-top: 12px; width: 100%; padding: 10px; font-weight: bold; cursor: pointer; border-radius: 4px; border: 1px solid #444; background: #eee;';
 
-function reportAssetLoaded() {
-  assetsLoaded++;
-  const pct = Math.min(100, Math.round((assetsLoaded / TOTAL_ASSETS_TO_LOAD) * 100));
-  loadingBar.style.width = pct + '%';
-  if (assetsLoaded >= TOTAL_ASSETS_TO_LOAD) {
-    loadingScreen.style.display = 'none';
-    mpLogin.style.display = 'flex';
-  }
+if (mpConnectBtn && mpConnectBtn.parentNode) {
+  mpConnectBtn.parentNode.appendChild(spPlayBtn);
 }
+
+spPlayBtn.addEventListener('click', () => {
+  console.log("[game] Initializing local single player environment...");
+  network = null; 
+  mpLogin.style.display = 'none';
+  updateHud();
+  // Call Pointer Lock directly inside user context loop
+  controls.lock();
+});
 
 // KICK OFF
 setHud(['Loading weapons and map...']);
