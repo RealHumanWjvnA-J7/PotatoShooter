@@ -39,7 +39,76 @@
     background: #0f0; color: #000; border: none; padding: 10px; font-weight: bold;
     font-family: monospace; cursor: pointer;
   }
-  #mp-login .hint { font-size: 11px; opacity: 0.7; margin-top: 5px; text-align: center; }
+  #mp-login .hint { font-size: 11px; opacity: 0.7; }
+  #mp-login .error { color: #ff5555; font-size: 12px; min-height: 16px; }
+  #mp-login .room-btn {
+    background: #111; color: #0f0; border: 1px solid #0f0; text-align: left;
+    display: flex; justify-content: space-between; padding: 10px;
+  }
+  #mp-login .room-btn:hover { background: #0f0; color: #000; }
+  #mp-login .tab-row { display: flex; gap: 4px; margin-bottom: 4px; }
+  #mp-login .tab-row button {
+    flex: 1; background: #111; border: 1px solid #0f0; color: #0f0; padding: 6px;
+  }
+  #mp-login .tab-row button.active { background: #0f0; color: #000; }
+
+  #loading-screen {
+    position: fixed; inset: 0; z-index: 40; background: #000; color: #0f0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    font-family: monospace;
+  }
+  #loading-screen .bar-outer {
+    width: 320px; height: 18px; border: 1px solid #0f0; margin-top: 14px;
+  }
+  #loading-screen .bar-inner {
+    height: 100%; width: 0%; background: #0f0; transition: width 0.2s;
+  }
+
+  #damage-vignette {
+    position: fixed; inset: 0; z-index: 12; pointer-events: none;
+    box-shadow: inset 0 0 0 0 rgba(255,0,0,0); transition: box-shadow 0.08s;
+  }
+
+  #kill-feed {
+    position: fixed; top: 12px; right: 12px; z-index: 11; color: #eee;
+    font-family: monospace; font-size: 13px; text-align: right;
+    text-shadow: 1px 1px 2px #000;
+  }
+  #kill-feed div { margin-bottom: 4px; opacity: 1; transition: opacity 2s; }
+
+  #loadout-screen {
+    position: fixed; inset: 0; z-index: 35; background: rgba(0,0,0,0.92);
+    color: #0f0; display: none; align-items: center; justify-content: center;
+    font-family: monospace; overflow-y: auto;
+  }
+  #loadout-screen .panel { width: 640px; max-width: 92vw; padding: 20px 0; }
+  #loadout-screen h2 { color: #0ff; margin-bottom: 6px; }
+  #loadout-screen .special-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 20px; }
+  #loadout-screen .special-card {
+    border: 1px solid #0f0; padding: 8px; cursor: pointer; font-size: 12px;
+  }
+  #loadout-screen .special-card.selected { background: #0f0; color: #000; }
+  #loadout-screen .special-card b { display: block; font-size: 14px; }
+  #loadout-screen .special-card .sub { opacity: 0.7; font-style: italic; }
+  #loadout-screen select {
+    background: #111; color: #0f0; border: 1px solid #0f0; padding: 6px; font-family: monospace;
+  }
+  #loadout-screen .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+  #loadout-confirm-btn {
+    background: #0f0; color: #000; border: none; padding: 12px 24px; font-weight: bold;
+    font-family: monospace; cursor: pointer; font-size: 15px; margin-top: 10px;
+  }
+  #armor-flip-result {
+    position: fixed; top: 40%; left: 50%; transform: translate(-50%, -50%);
+    z-index: 36; color: #fff; font-family: monospace; font-size: 20px;
+    background: rgba(0,0,0,0.8); padding: 16px 24px; border: 1px solid #0f0; display: none;
+  }
+  #start-line-banner {
+    position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%);
+    z-index: 11; color: #ffd; font-family: monospace; font-size: 16px; font-style: italic;
+    text-shadow: 1px 1px 3px #000; text-align: center; max-width: 80vw; opacity: 0;
+    transition: opacity 1s;
+  }
 </style>
 </head>
 <body>
@@ -47,17 +116,70 @@
 <div id="scope"></div>
 <div id="hud">Loading...</div>
 <div id="blocker"></div>
+<div id="damage-vignette"></div>
+<div id="kill-feed"></div>
+<div id="start-line-banner"></div>
+<div id="armor-flip-result"></div>
 
-<div id="mp-login">
-  <div class="box">
-    <h2 style="text-align: center; margin-bottom: 10px;">GLTF BLOCK ARENA</h2>
-    <input type="text" id="mp-name" placeholder="Player Name" value="Player">
-    <input type="text" id="mp-url" placeholder="Server URL (ws://...)" value="">
-    <button id="mp-connect-btn">Connect & Play Multiplayer</button>
-    <div class="hint">Leave URL blank to use Single Player mode.</div>
+<div id="loadout-screen">
+  <div class="panel">
+    <h2>CHOOSE YOUR SPECIAL</h2>
+    <div class="special-grid" id="special-grid"></div>
+
+    <h2>SECONDARY</h2>
+    <div class="row"><select id="loadout-secondary"></select></div>
+
+    <h2>PRIMARIES (pick 2)</h2>
+    <div class="row">
+      <select id="loadout-primary-1"></select>
+      <select id="loadout-primary-2"></select>
+    </div>
+
+    <div class="row" id="armor-choice-row" style="display:none;">
+      <label>
+        <input type="checkbox" id="loadout-armor-checkbox">
+        Replace Primary 2 with 40 Armor (non-regenerating) instead of a weapon
+      </label>
+    </div>
+
+    <button id="loadout-confirm-btn">CONFIRM &amp; DROP IN</button>
   </div>
 </div>
 
-<script type="module" src="main.js"></script>
+<div id="loading-screen">
+  <div>LOADING POTATOSHOOTER...</div>
+  <div class="bar-outer"><div class="bar-inner" id="loading-bar"></div></div>
+</div>
+
+<div id="mp-login" style="display:none;">
+  <div class="box" id="mp-auth-panel">
+    <div class="tab-row">
+      <button id="mp-tab-login" class="active">LOG IN</button>
+      <button id="mp-tab-signup">SIGN UP</button>
+    </div>
+    <input id="mp-email" type="email" placeholder="Email">
+    <input id="mp-password" type="password" placeholder="Password">
+    <div class="error" id="mp-auth-error"></div>
+    <button id="mp-auth-submit">LOG IN</button>
+    <button id="mp-solo-btn" style="background:#333; color:#0f0; border:1px solid #0f0;">PLAY SOLO (no account)</button>
+  </div>
+
+  <div class="box" id="mp-room-panel" style="display:none;">
+    <div>Welcome, <span id="mp-welcome-name"></span></div>
+    <input id="mp-display-name" placeholder="Display name (shown in-game)" maxlength="24">
+    <div>Choose a server:</div>
+    <div id="mp-room-list"></div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="./main.js"></script>
 </body>
 </html>

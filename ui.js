@@ -1,5 +1,15 @@
 import * as THREE from 'three';
 
+// -----------------------------
+// UI / GRAPHICS SYSTEM
+// Pulled out of main.js since the settings menu markup + the graphics
+// quality/bloom logic together were a big, mostly self-contained chunk.
+// createUISystem() takes references to the handful of main.js things it
+// actually needs (as a deps object) and returns the handful of things
+// main.js needs back. Nothing here reaches into main.js's globals directly -
+// that's the whole point of splitting it out.
+// -----------------------------
+
 export function createCircleTexture(size, blurRadius = 0) {
   const canvas = document.createElement('canvas');
   canvas.width = size;
@@ -144,11 +154,28 @@ export function createUISystem(deps) {
 
   function buildUI() {
     const menuHTML = `
-      <div id="game-menu" style="display:none; position:absolute; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); z-index:9999; color:white; font-family:monospace; padding:50px; box-sizing:border-box;">
+      <div id="game-menu" style="display:none; position:absolute; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); z-index:9999; color:white; font-family:monospace; padding:50px; box-sizing:border-box; overflow-y:auto;">
         <h1 style="color:#00ffcc;">GAME MENU</h1>
         <button id="btn-resume" style="padding:10px 20px; font-size:16px; margin-bottom:20px; cursor:pointer;">Resume</button>
 
-        <h2>Options</h2>
+        <h2>Scoreboard</h2>
+        <table id="scoreboard-table" style="border-collapse:collapse; margin-bottom:20px; min-width:320px;">
+          <thead>
+            <tr style="text-align:left; border-bottom:1px solid #555;">
+              <th style="padding:4px 12px 4px 0;">Player</th>
+              <th style="padding:4px 12px;">Kills</th>
+              <th style="padding:4px 12px;">Deaths</th>
+              <th style="padding:4px 12px;"></th>
+            </tr>
+          </thead>
+          <tbody id="scoreboard-body">
+            <tr><td colspan="4" style="padding:4px; opacity:0.6;">Not connected to a server.</td></tr>
+          </tbody>
+        </table>
+
+        <h2>Settings</h2>
+        <button id="btn-open-settings" style="padding:8px 16px; cursor:pointer; margin-bottom:16px;">Open Graphics/Options</button>
+        <div id="settings-body" style="display:none;">
         <div style="margin-bottom:10px;">
           <label>Debug Tracers:</label>
           <button id="btn-tracers">OFF</button>
@@ -177,9 +204,18 @@ export function createUISystem(deps) {
           <label>Camera Bob Intensity (0.00 - 2.00): <span id="bob-val">0.60</span></label><br>
           <input type="range" id="slider-bob" min="0" max="2" step="0.05" value="0.6" style="width:200px;">
         </div>
+        </div>
       </div>
     `;
     document.body.insertAdjacentHTML('beforeend', menuHTML);
+
+    const btnOpenSettings = document.getElementById('btn-open-settings');
+    const settingsBody = document.getElementById('settings-body');
+    btnOpenSettings.addEventListener('click', () => {
+      const showing = settingsBody.style.display !== 'none';
+      settingsBody.style.display = showing ? 'none' : 'block';
+      btnOpenSettings.textContent = showing ? 'Open Graphics/Options' : 'Hide Graphics/Options';
+    });
 
     const btnResume = document.getElementById('btn-resume');
     const btnTracers = document.getElementById('btn-tracers');
@@ -248,6 +284,47 @@ export function createUISystem(deps) {
   }
 
   buildUI();
+  setAdminMode(false); // hidden by default until solo/admin status is confirmed
 
-  return { toggleMenu, applyGraphicsSettings, sunGroup };
+  function updateScoreboard(rows, isAdminFlag, onBanClick) {
+    const tbody = document.getElementById('scoreboard-body');
+    if (!tbody) return;
+    if (!rows || rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="4" style="padding:4px; opacity:0.6;">Not connected to a server.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = '';
+    rows.forEach((row) => {
+      const tr = document.createElement('tr');
+      tr.style.borderBottom = '1px solid #333';
+      const isYou = row.name.endsWith('(you)');
+      const banCell = (isAdminFlag && !isYou && row.uid)
+        ? `<button data-uid="${row.uid}" class="scoreboard-ban-btn" style="background:#661111; color:#fff; border:none; padding:2px 8px; cursor:pointer;">BAN</button>`
+        : '';
+      tr.innerHTML = `
+        <td style="padding:4px 12px 4px 0;">${row.name}</td>
+        <td style="padding:4px 12px;">${row.kills}</td>
+        <td style="padding:4px 12px;">${row.deaths}</td>
+        <td style="padding:4px 12px;">${banCell}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+
+    if (isAdminFlag && onBanClick) {
+      tbody.querySelectorAll('.scoreboard-ban-btn').forEach((btn) => {
+        btn.addEventListener('click', () => onBanClick(btn.dataset.uid));
+      });
+    }
+  }
+
+  function setAdminMode(isAdminFlag) {
+    ['btn-tracers', 'btn-wireframe', 'btn-visible-player'].forEach((id) => {
+      const btn = document.getElementById(id);
+      if (!btn) return;
+      const row = btn.closest('div');
+      if (row) row.style.display = isAdminFlag ? 'block' : 'none';
+    });
+  }
+
+  return { toggleMenu, applyGraphicsSettings, sunGroup, updateScoreboard, setAdminMode };
 }

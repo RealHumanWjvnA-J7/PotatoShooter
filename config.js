@@ -4,7 +4,7 @@ export const MAP_SCALE = 0.110;
 export const DEFAULT_TARGET_LENGTH = 0.9;
 export const DEFAULT_SCALE_MULTIPLIER = 3.0;
 
-export const ANIM_NAMES = ['shoot', 'bolt', 'reload', 'inspect', 'rack'];
+export const ANIM_NAMES = ['shoot', 'bolt', 'reload', 'reload1', 'reload2', 'inspect', 'rack'];
 
 export const NORMAL_FOV = 70;
 export const FAKE_SCOPE_FOV = 55;
@@ -18,6 +18,7 @@ export const WEAPON_CONFIGS = [
   {
     name: 'Pistol',
     file: 'assets/Pistol.gltf',
+    slot: 'secondary',
     magSize: 12,
     fireMode: 'semi',
     damage: 7,
@@ -33,6 +34,7 @@ export const WEAPON_CONFIGS = [
   {
     name: 'Rifle',
     file: 'assets/rifle.gltf',
+    slot: 'primary',
     magSize: 30,
     fireMode: 'auto',
     fireRate: 20,
@@ -49,6 +51,7 @@ export const WEAPON_CONFIGS = [
   {
     name: 'Shotgun',
     file: 'assets/shotgun.gltf',
+    slot: 'primary',
     magSize: 7,
     fireMode: 'semi',
     damage: 5,
@@ -66,6 +69,7 @@ export const WEAPON_CONFIGS = [
   {
     name: 'Double Barrel',
     file: 'assets/db.gltf',
+    slot: 'primary',
     magSize: 2,
     fireMode: 'semi',
     damage: 7,
@@ -83,6 +87,7 @@ export const WEAPON_CONFIGS = [
   {
     name: 'SMG',
     file: 'assets/smg.gltf',
+    slot: 'primary',
     magSize: 40,
     fireMode: 'auto',
     fireRate: 25,  
@@ -99,6 +104,7 @@ export const WEAPON_CONFIGS = [
   {
     name: 'Sniper',
     file: 'assets/sniper.gltf',
+    slot: 'primary',
     magSize: 5,
     fireMode: 'semi',
     damage: 60,
@@ -114,6 +120,77 @@ export const WEAPON_CONFIGS = [
 ];
 
 export const ROOMS = ['Server 1', 'Server 2', 'Server 3', 'Server 4', 'Server 5'];
+
+// -----------------------------
+// SPECIALS (perk classes) - chosen at loadout screen each life
+// -----------------------------
+// hpDelta: added to MAX_HP for that life
+// speedMult: multiplies MOVE_SPEED
+// scaleMult: multiplies player model/hitbox size (visual + collision, synced to others)
+// ASSUMPTION: base headshot multiplier (applies to everyone, not special-specific)
+export const HEADSHOT_MULTIPLIER = 2.0;
+
+// ASSUMPTION: Heavy's "chance to swap a primary for Armor" - implemented as a
+// 50% coin flip shown to the player right after they confirm their loadout.
+export const HEAVY_ARMOR_SWAP_CHANCE = 0.5;
+export const HEAVY_ARMOR_HP = 40; // flat, non-regenerating
+
+export const SPECIALS = {
+  heavy: {
+    id: 'heavy', name: 'Heavy', subtitle: '"Who touched Sasha"',
+    startLine: "Some people think they can outsmart me. Maybe, maybe. I've yet to meet one that can outsmart bullet.",
+    hpDelta: 15, speedMult: 0.85, scaleMult: 1.075,
+    description: '+15 HP, -15% speed, 7.5% larger. Chance to swap a primary for 40 armor (non-regen).',
+  },
+  slim: {
+    id: 'slim', name: 'Slim', subtitle: '"Speedy boi"',
+    startLine: 'Oh hey look a squirrel',
+    hpDelta: -10, speedMult: 1.075, scaleMult: 0.95,
+    lowHpThreshold: 50, lowHpSpeedMult: 1.075, lowHpScaleMult: 0.95, // stacks multiplicatively when under threshold
+    description: '-10 HP, +7.5% speed, 5% smaller. Under 50 HP: another +7.5% speed and -5% size.',
+  },
+  sniper: {
+    id: 'sniper', name: 'Pryvyd', subtitle: '"Sniper"',
+    startLine: 'Привет! Пора надрать всем задницы!',
+    recoilMult: 0.75, sniperDamageMult: 1.10, rangeDamageBonusPer25: 2,
+    description: '25% less recoil on every gun. Sniper rifle deals 10% more. +2 dmg per 25 units traveled.',
+  },
+  bulletier: {
+    id: 'bulletier', name: 'Bulletier', subtitle: '"Someone wouldn\'t stop asking for an SMG"',
+    startLine: "Spray n' Pray",
+    smgDamageMult: 1.05, smgFireRateMult: 1.05,
+    lowHpThreshold: 75, smgLowHpSpeedMult: 1.05,
+    description: 'SMGs: +5% damage, +5% fire rate. Under 75 HP while holding an SMG: +5% more speed.',
+  },
+  shotty: {
+    id: 'shotty', name: 'Shotty', subtitle: '"Zomboid special"',
+    startLine: '6 feet my guy, 6 feet!',
+    shotgunSpreadMult: 0.90, shotgunDamageMult: 1.05,
+    allowDoubleBarrelSecondary: true,
+    description: 'Shotguns: -10% spread, +5% damage. Can pick Double Barrel as a secondary.',
+  },
+  cowboy: {
+    id: 'cowboy', name: 'Wannabe Cowboy', subtitle: '"KaPOW!"',
+    startLine: 'Not enough holes in that guy',
+    pistolFireRateMult: 1.15, pistolReloadSpeedMult: 1.15, pistolHeadshotBonusMult: 1.25,
+    description: 'Pistols: +15% fire rate/anim speed, +15% reload speed, headshots +25% extra damage.',
+  },
+  lucky: {
+    id: 'lucky', name: 'Lucky', subtitle: '"Somehow..."',
+    startLine: 'They said this was a casino!',
+    surviveLethalChance: 0.10, critChance: 0.05, critMult: 1.25,
+    regenSpeedMult: 1.15, headshotInstaDownChance: 0.001,
+    description: '10% chance to survive a lethal hit at 1 HP (once/life). 5% chance a shot deals +25%. Regen 15% faster. 0.1% headshot insta-down.',
+  },
+  florida: {
+    id: 'florida', name: 'Florida Man', subtitle: '"Can\'t damage what isn\'t there."',
+    startLine: 'Florida man steals ambulance, finishes beer before being arrested.',
+    damageTakenMult: 0.95, shotgunRifleDamageMult: 1.025, speedMult: 1.05, scaleMult: 1.035,
+    headshotImmune: true,
+    description: 'Takes 5% less damage. Shotguns/rifles +2.5% damage. +5% speed, 3.5% larger. Immune to headshot bonus damage.',
+  },
+};
+export const SPECIAL_LIST = Object.values(SPECIALS);
 
 export const MAX_HP = 150;
 

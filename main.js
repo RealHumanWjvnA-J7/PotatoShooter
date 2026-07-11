@@ -5,16 +5,29 @@ import {
   MAP_FILE, MAP_SCALE, DEFAULT_TARGET_LENGTH, DEFAULT_SCALE_MULTIPLIER,
   ANIM_NAMES, NORMAL_FOV, FAKE_SCOPE_FOV, MAX_BULLET_HOLES, WEAPON_CONFIGS,
   MAX_HP, GRAPHICS_PROFILES, ANTI_ALIASING_TIERS,
+  HP_REGEN_DELAY, HP_REGEN_RATE, RESPAWN_DELAY, SPAWN_POINTS,
   MOVE_SPEED, SPRINT_MULTIPLIER, CROUCH_SPEED_MULTIPLIER, JUMP_SPEED, GRAVITY,
   STAND_HEIGHT, CROUCH_HEIGHT, PLAYER_RADIUS, LEAN_ANGLE, LEAN_OFFSET,
-  BOB_SMOOTHING, BOB_PROFILES,
+  BOB_SMOOTHING, BOB_PROFILES, ROOMS,
+  SPECIALS, SPECIAL_LIST, HEADSHOT_MULTIPLIER, HEAVY_ARMOR_HP,
 } from './config.js';
 import { createUISystem } from './ui.js';
 import { TargetCube } from './targetCube.js'; // IMPORTED TARGET CUBE
-import { createNetworkSystem } from './network.js';
+import { createNetworkSystem, loginOrSignUp, fetchRoomCounts, banPlayer } from './network.js';
 
 // ENGINE SETTINGS
 let playerHp = 150;
+let isDead = false;
+let lastDamageTime = -Infinity; // seconds, from performance.now()/1000
+let respawnAt = 0;              // seconds, from performance.now()/1000
+let awaitingLoadoutPick = false; // true once the death countdown ends and we're waiting on the picker
+
+// SPECIALS / LOADOUT STATE
+let currentSpecial = null;      // one of SPECIALS, or null before first pick
+let effectiveMaxHp = MAX_HP;
+let armorHp = 0;                // Heavy's flat non-regen shield, if the coinflip lands
+let usedLuckySurvive = false;   // Lucky's "survive lethal" - once per life
+let allowedWeaponIndices = new Set(WEAPON_CONFIGS.map((_, i) => i)); // until a loadout is picked, allow everything (solo default)
 
 const settings = {
   debugTracers: false,
@@ -26,7 +39,10 @@ const settings = {
   bobIntensity: 2
 };
 
-let network = null; // set up once the player clicks PLAY on the connect overlay
+let network = null; // set up once the player picks a room on the connect overlay
+let isAdmin = false;
+let myUid = null;
+let myDisplayName = 'Player';
 
 let noclip = false;
 let freecam = false;
@@ -111,7 +127,7 @@ scene.add(playerHitbox);
 const activeTracers = [];
 const controls = new PointerLockControls(cameraGroup, document.body);
 
-const { toggleMenu, applyGraphicsSettings, sunGroup } = createUISystem({
+const { toggleMenu, applyGraphicsSettings, sunGroup, updateScoreboard, setAdminMode } = createUISystem({
   scene, sun, renderer, settings, GRAPHICS_PROFILES, ANTI_ALIASING_TIERS,
   getCollidables: () => collidables,
   activeTracers,
@@ -195,7 +211,7 @@ document.addEventListener('wheel', (e) => {
   
   for (let i = 0; i < weapons.length; i++) {
     targetIndex = (targetIndex + step + weapons.length) % weapons.length;
-    if (weapons[targetIndex].loaded) {
+    if (weapons[targetIndex].loaded && allowedWeaponIndices.has(targetIndex)) {
       switchWeapon(targetIndex);
       break;
     }
@@ -328,9 +344,10 @@ function loadWeaponAssets(index) {
       
       w.loaded = true;
       updateHud();
+      reportAssetLoaded();
     },
     undefined,
-    (err) => { console.error(`Failed to load weapon:`, err); updateHud(); }
+    (err) => { console.error(`Failed to load weapon:`, err); updateHud(); reportAssetLoaded(); }
   );
 }
 
@@ -355,21 +372,24 @@ function loadMap(path) {
       collidables.push(myTarget.mesh);
       
       applyGraphicsSettings();
+      reportAssetLoaded();
     },
     undefined,
     (err) => { 
       collidables = [fallbackGround, myTarget.mesh]; 
+      reportAssetLoaded();
     }
   );
 }
 
-function playAnim(w, name, { onFinish } = {}) {
+function playAnim(w, name, { onFinish, timeScale = 1 } = {}) {
   const action = w.actions[name];
   if (!action) { if (onFinish) onFinish(); return false; }
   
   w.mixer.stopAllAction();
   
   action.reset();
+  action.timeScale = timeScale;
   action.play();
   if (onFinish) {
     const onDone = (e) => {
@@ -381,14 +401,22 @@ function playAnim(w, name, { onFinish } = {}) {
 }
 
 function updateHud() {
-  let lines = [`HP: ${Math.floor(playerHp)} / ${MAX_HP}`];
+  let lines = [`HP: ${Math.floor(playerHp)} / ${effectiveMaxHp}` + (armorHp > 0 ? ` (+${Math.ceil(armorHp)} armor)` : '')];
   if (noclip) lines[0] += " | [NOCLIP]";
   if (freecam) lines[0] += " | [FREECAM]";
 
+  if (isDead) {
+    const secsLeft = Math.max(0, Math.ceil(respawnAt - performance.now() / 1000));
+    lines = [`YOU DIED - respawning in ${secsLeft}...`];
+    setHud(lines);
+    return;
+  }
+
   lines.push(WEAPON_CONFIGS.map((cfg, i) => {
+    if (!allowedWeaponIndices.has(i)) return null;
     const tag = weapons[i].loaded ? cfg.name : `${cfg.name} (missing)`;
     return i === currentIndex ? `[${i + 1}:${tag}]` : `${i + 1}:${tag}`;
-  }).join('  '));
+  }).filter(Boolean).join('  '));
 
   const w = W();
   if (w.loaded) {
@@ -409,6 +437,7 @@ function tryShoot() {
 
   w.ammo--; w.isBusy = true;
   playAnim(w, 'shoot', {
+    timeScale: applyPistolTimeScale(w),
     onFinish: () => {
       w.isBusy = false;
       if (w.boltAction) w.waitingForBolt = true;
@@ -416,14 +445,15 @@ function tryShoot() {
     }
   });
 
-  const kickY = w.cfg.recoilY ?? 0.02;
-  const kickX = w.cfg.recoilX ?? 0.01;
+  const recoilMult = getRecoilMultiplier();
+  const kickY = (w.cfg.recoilY ?? 0.02) * recoilMult;
+  const kickX = (w.cfg.recoilX ?? 0.01) * recoilMult;
   targetRecoilX += kickY;
   targetRecoilY += (Math.random() - 0.5) * kickX;
 
   if (w.cfg.pellets && w.cfg.pellets > 1) {
     const pelletCount = w.cfg.pellets;
-    const spread = w.cfg.spreadAngle ?? 0.05;
+    const spread = (w.cfg.spreadAngle ?? 0.05) * getShotgunSpreadMultiplier();
     for (let i = 0; i < pelletCount; i++) {
       const offsetX = (Math.random() - 0.5) * spread;
       const offsetY = (Math.random() - 0.5) * spread;
@@ -465,7 +495,19 @@ function tryReload() {
   if (!w.loaded || w.isBusy || w.isReloading || w.ammo >= w.cfg.magSize) return;
   w.isReloading = true; w.isBusy = true;
   updateHud();
-  playAnim(w, 'reload', {
+
+  let animName = 'reload';
+  if (w.cfg.name === 'Double Barrel') {
+    // ammo remaining tells us how many barrels are still loaded
+    if (w.ammo === 1 && w.actions['reload1']) animName = 'reload1';
+    else if (w.ammo === 0 && w.actions['reload2']) animName = 'reload2';
+  } else if (w.cfg.name === 'Sniper') {
+    // reload{ammo} for 1-4 bullets remaining, plain 'reload' (all 5) when fully empty
+    if (w.ammo >= 1 && w.ammo <= 4 && w.actions[`reload${w.ammo}`]) animName = `reload${w.ammo}`;
+  }
+
+  playAnim(w, animName, {
+    timeScale: applyPistolReloadTimeScale(w),
     onFinish: () => {
       w.ammo = w.cfg.magSize; w.isReloading = false; w.isBusy = false; w.waitingForBolt = false;
       updateHud();
@@ -491,30 +533,117 @@ function switchWeapon(index) {
   updateHud();
 }
 
+// -----------------------------
+// SPECIALS: STAT MODIFIER HELPERS
+// -----------------------------
+function getWeaponDamageMultiplier(cfg) {
+  let mult = 1;
+  if (!currentSpecial) return mult;
+  if (currentSpecial.id === 'sniper' && cfg.name === 'Sniper') mult *= currentSpecial.sniperDamageMult;
+  if (currentSpecial.id === 'bulletier' && cfg.name === 'SMG') mult *= currentSpecial.smgDamageMult;
+  if (currentSpecial.id === 'shotty' && cfg.pellets) mult *= currentSpecial.shotgunDamageMult;
+  if (currentSpecial.id === 'florida' && (cfg.pellets || cfg.name === 'Rifle')) mult *= currentSpecial.shotgunRifleDamageMult;
+  return mult;
+}
+
+function getRecoilMultiplier() {
+  return (currentSpecial && currentSpecial.id === 'sniper') ? currentSpecial.recoilMult : 1;
+}
+
+function getFireRateMultiplier(cfg) {
+  return (currentSpecial && currentSpecial.id === 'bulletier' && cfg.name === 'SMG') ? currentSpecial.smgFireRateMult : 1;
+}
+
+function getShotgunSpreadMultiplier() {
+  return (currentSpecial && currentSpecial.id === 'shotty') ? currentSpecial.shotgunSpreadMult : 1;
+}
+
+function computeSpeedMultiplier() {
+  let mult = 1;
+  if (!currentSpecial) return mult;
+  if (currentSpecial.speedMult) mult *= currentSpecial.speedMult;
+  if (currentSpecial.id === 'slim' && playerHp < currentSpecial.lowHpThreshold) mult *= currentSpecial.lowHpSpeedMult;
+  if (currentSpecial.id === 'bulletier' && playerHp < currentSpecial.lowHpThreshold && W().loaded && W().cfg.name === 'SMG') mult *= currentSpecial.smgLowHpSpeedMult;
+  return mult;
+}
+
+function computeScaleMultiplier() {
+  let mult = (currentSpecial && currentSpecial.scaleMult) ? currentSpecial.scaleMult : 1;
+  if (currentSpecial && currentSpecial.id === 'slim' && playerHp < currentSpecial.lowHpThreshold) mult *= currentSpecial.lowHpScaleMult;
+  return mult;
+}
+
+function getRegenRateMultiplier() {
+  return (currentSpecial && currentSpecial.regenSpeedMult) ? currentSpecial.regenSpeedMult : 1;
+}
+
+function applyPistolTimeScale(w) {
+  if (currentSpecial && currentSpecial.id === 'cowboy' && w.cfg.name === 'Pistol') return currentSpecial.pistolFireRateMult;
+  return 1;
+}
+function applyPistolReloadTimeScale(w) {
+  if (currentSpecial && currentSpecial.id === 'cowboy' && w.cfg.name === 'Pistol') return currentSpecial.pistolReloadSpeedMult;
+  return 1;
+}
+
 function raycastHit(offsetX = 0, offsetY = 0) {
   const raycaster = new THREE.Raycaster();
   _scratchVec2D.set(offsetX, offsetY);
   raycaster.setFromCamera(_scratchVec2D, camera);
 
+  const hits = raycaster.intersectObjects(collidables, true);
+  const wallDist = hits.length ? hits[0].distance : Infinity;
+
+  // Check remote players too, since they're not part of `collidables`.
+  // Only counts as a hit if it's actually closer than the nearest wall -
+  // otherwise you'd be shooting someone through solid geometry.
   if (network) {
     const remoteMeshes = network.getRemotePlayerMeshes();
     if (remoteMeshes.length > 0) {
       const playerHits = raycaster.intersectObjects(remoteMeshes, true);
-      if (playerHits.length > 0) {
-        const hitId = playerHits[0].object.userData.remotePlayerId;
+      if (playerHits.length > 0 && playerHits[0].distance < wallDist) {
+        const hitObj = playerHits[0].object;
+        const hitId = hitObj.userData.remotePlayerId;
+        const isHeadshot = !!hitObj.userData.isHeadshot;
+
         if (hitId) {
-          const dmg = W().cfg.damage || 25;
-          network.sendHit(hitId, dmg);
+          const w = W();
+          let dmg = (w.cfg.damage || 25) * getWeaponDamageMultiplier(w.cfg);
+
+          if (currentSpecial && currentSpecial.id === 'sniper' && w.cfg.name === 'Sniper') {
+            dmg += Math.floor(playerHits[0].distance / 25) * currentSpecial.rangeDamageBonusPer25;
+          }
+
+          const bodyEquivalentDamage = dmg; // pre-headshot-bonus value, for Florida Man's immunity on the receiving end
+
+          if (isHeadshot) {
+            dmg *= HEADSHOT_MULTIPLIER;
+            if (currentSpecial && currentSpecial.id === 'cowboy' && w.cfg.name === 'Pistol') {
+              dmg *= currentSpecial.pistolHeadshotBonusMult;
+            }
+          }
+
+          let instaDown = false;
+          if (currentSpecial && currentSpecial.id === 'lucky') {
+            if (Math.random() < currentSpecial.critChance) dmg *= currentSpecial.critMult;
+            if (isHeadshot && Math.random() < currentSpecial.headshotInstaDownChance) instaDown = true;
+          }
+
+          if (instaDown) {
+            const targetKnownHp = network.getRemotePlayers().get(hitId)?.hp ?? 150;
+            dmg = Math.max(dmg, targetKnownHp - 1);
+          }
+
+          network.sendHit(hitId, dmg, isHeadshot, bodyEquivalentDamage);
         }
       }
     }
   }
 
-  const hits = raycaster.intersectObjects(collidables, true);
-  
   if (hits.length) {
     const hit = hits[0];
     
+    // RAYCAST DAMAGE PROCESSING BLOCK
     if (hit.object.userData.isTargetCube) {
       const dmg = W().cfg.damage || 25; 
       hit.object.userData.parentInstance.takeDamage(dmg);
@@ -558,8 +687,12 @@ document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Tab') { e.preventDefault(); toggleMenu(); return; }
-  if (e.code === 'BracketLeft') { noclip = !noclip; if (noclip) { verticalVelocity = 0; grounded = true; } updateHud(); return; }
-  if (e.code === 'BracketRight') { freecam = !freecam; if (freecam) freecamPos.copy(cameraGroup.position); updateHud(); return; }
+  if (!isAdmin) {
+    if (e.code === 'BracketLeft' || e.code === 'BracketRight') return; // debug tools, admin only
+  } else {
+    if (e.code === 'BracketLeft') { noclip = !noclip; if (noclip) { verticalVelocity = 0; grounded = true; } updateHud(); return; }
+    if (e.code === 'BracketRight') { freecam = !freecam; if (freecam) freecamPos.copy(cameraGroup.position); updateHud(); return; }
+  }
 
   if (!controls.isLocked) return;
   switch (e.code) {
@@ -571,7 +704,10 @@ document.addEventListener('keydown', (e) => {
       break;
     default:
       const m = /^Digit([1-9])$/.exec(e.code);
-      if (m) switchWeapon(parseInt(m[1], 10) - 1);
+      if (m) {
+        const idx = parseInt(m[1], 10) - 1;
+        if (allowedWeaponIndices.has(idx)) switchWeapon(idx);
+      }
   }
 });
 
@@ -598,6 +734,178 @@ window.addEventListener('resize', () => {
   viewmodelCamera.aspect = aspect;
   viewmodelCamera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// -----------------------------
+// DAMAGE FEEDBACK / KILL FEED
+// -----------------------------
+const damageVignette = document.getElementById('damage-vignette');
+function flashDamage(amount) {
+  const intensity = Math.min(1, amount / 40); // scales with hit size, caps out
+  damageVignette.style.boxShadow = `inset 0 0 ${80 + intensity * 60}px ${20 + intensity * 20}px rgba(255,0,0,${0.35 + intensity * 0.35})`;
+  clearTimeout(flashDamage._t);
+  flashDamage._t = setTimeout(() => { damageVignette.style.boxShadow = 'inset 0 0 0 0 rgba(255,0,0,0)'; }, 220);
+}
+
+const killFeedEl = document.getElementById('kill-feed');
+function pushKillFeed(text) {
+  const line = document.createElement('div');
+  line.textContent = text;
+  killFeedEl.appendChild(line);
+  setTimeout(() => { line.style.opacity = '0'; }, 4000);
+  setTimeout(() => { line.remove(); }, 6000);
+  while (killFeedEl.children.length > 5) killFeedEl.removeChild(killFeedEl.firstChild);
+}
+
+// -----------------------------
+// HP / DEATH / RESPAWN
+// -----------------------------
+function die(killerName = null) {
+  if (isDead) return;
+  isDead = true;
+  awaitingLoadoutPick = false;
+  playerHp = 0;
+  respawnAt = performance.now() / 1000 + RESPAWN_DELAY;
+  leftMouseDown = false;
+  if (controls.isLocked) controls.unlock();
+  if (network) network.sendDeath(killerName);
+  updateHud();
+}
+
+function actuallyRespawn() {
+  const spawn = SPAWN_POINTS[Math.floor(Math.random() * SPAWN_POINTS.length)];
+  playerPos.set(spawn[0], spawn[1], spawn[2]);
+  cameraGroup.position.copy(playerPos);
+  verticalVelocity = 0;
+  grounded = true;
+  playerHp = effectiveMaxHp;
+  isDead = false;
+  awaitingLoadoutPick = false;
+  lastDamageTime = performance.now() / 1000;
+  usedLuckySurvive = false; // resets every life
+  updateHud();
+}
+
+// -----------------------------
+// LOADOUT SCREEN (specials + weapon picks) - shown on first spawn and every respawn
+// -----------------------------
+const loadoutScreen = document.getElementById('loadout-screen');
+const specialGrid = document.getElementById('special-grid');
+const secondarySelect = document.getElementById('loadout-secondary');
+const primary1Select = document.getElementById('loadout-primary-1');
+const primary2Select = document.getElementById('loadout-primary-2');
+const loadoutConfirmBtn = document.getElementById('loadout-confirm-btn');
+const armorChoiceRow = document.getElementById('armor-choice-row');
+const armorCheckbox = document.getElementById('loadout-armor-checkbox');
+const armorFlipEl = document.getElementById('armor-flip-result');
+const startLineBanner = document.getElementById('start-line-banner');
+
+let selectedSpecialId = SPECIAL_LIST[0].id;
+let loadoutOnConfirm = null;
+
+function showStartLine(text) {
+  startLineBanner.textContent = text;
+  startLineBanner.style.opacity = '1';
+  clearTimeout(showStartLine._t);
+  showStartLine._t = setTimeout(() => { startLineBanner.style.opacity = '0'; }, 5000);
+}
+
+function buildSpecialGrid() {
+  specialGrid.innerHTML = '';
+  SPECIAL_LIST.forEach((sp) => {
+    const card = document.createElement('div');
+    card.className = 'special-card' + (sp.id === selectedSpecialId ? ' selected' : '');
+    card.innerHTML = `<b>${sp.name}</b><span class="sub">${sp.subtitle}</span><div>${sp.description}</div>`;
+    card.addEventListener('click', () => {
+      selectedSpecialId = sp.id;
+      buildSpecialGrid();
+      buildWeaponSelects();
+    });
+    specialGrid.appendChild(card);
+  });
+}
+
+function buildWeaponSelects() {
+  const special = SPECIALS[selectedSpecialId];
+  const secondaries = WEAPON_CONFIGS
+    .map((cfg, i) => ({ cfg, i }))
+    .filter(({ cfg }) => cfg.slot === 'secondary' || (special.allowDoubleBarrelSecondary && cfg.name === 'Double Barrel'));
+  const primaries = WEAPON_CONFIGS
+    .map((cfg, i) => ({ cfg, i }))
+    .filter(({ cfg }) => cfg.slot === 'primary');
+
+  secondarySelect.innerHTML = secondaries.map(({ cfg, i }) => `<option value="${i}">${cfg.name}</option>`).join('');
+
+  function fillPrimarySelect(sel, excludeIndex) {
+    const prevVal = sel.value;
+    sel.innerHTML = primaries
+      .filter(({ i }) => i !== excludeIndex)
+      .map(({ cfg, i }) => `<option value="${i}">${cfg.name}</option>`).join('');
+    if ([...sel.options].some(o => o.value === prevVal)) sel.value = prevVal;
+  }
+
+  fillPrimarySelect(primary1Select, parseInt(primary2Select.value, 10));
+  fillPrimarySelect(primary2Select, parseInt(primary1Select.value, 10));
+
+  armorChoiceRow.style.display = (special.id === 'heavy') ? 'block' : 'none';
+  if (special.id !== 'heavy') armorCheckbox.checked = false;
+  updateArmorCheckboxLabel();
+}
+
+function updateArmorCheckboxLabel() {
+  const cfg = WEAPON_CONFIGS[parseInt(primary2Select.value, 10)];
+  const label = document.querySelector('#armor-choice-row label');
+  if (label && cfg) {
+    label.childNodes[label.childNodes.length - 1].textContent = ` Replace ${cfg.name} (Primary 2) with 40 Armor (non-regenerating) instead of a weapon`;
+  }
+}
+
+primary1Select.addEventListener('change', () => buildWeaponSelects());
+primary2Select.addEventListener('change', () => { buildWeaponSelects(); updateArmorCheckboxLabel(); });
+primary2Select.addEventListener('change', () => buildWeaponSelects());
+
+function openLoadoutScreen(onConfirm) {
+  loadoutOnConfirm = onConfirm;
+  buildSpecialGrid();
+  buildWeaponSelects();
+  loadoutScreen.style.display = 'flex';
+}
+
+loadoutConfirmBtn.addEventListener('click', () => {
+  const special = SPECIALS[selectedSpecialId];
+  currentSpecial = special;
+  effectiveMaxHp = Math.max(1, MAX_HP + (special.hpDelta || 0));
+  armorHp = 0;
+
+  const secIdx = parseInt(secondarySelect.value, 10);
+  const p1Idx = parseInt(primary1Select.value, 10);
+  const p2Idx = parseInt(primary2Select.value, 10);
+  allowedWeaponIndices = new Set([secIdx, p1Idx, p2Idx]);
+
+  // Reset ammo on the chosen loadout so every life starts topped up
+  [secIdx, p1Idx, p2Idx].forEach((i) => {
+    if (weapons[i]) weapons[i].ammo = WEAPON_CONFIGS[i].magSize;
+  });
+  currentIndex = secIdx; // hands them their secondary by default; they can switch immediately
+
+  loadoutScreen.style.display = 'none';
+  showStartLine(special.startLine);
+
+  if (special.id === 'heavy' && armorCheckbox.checked) {
+    // Player explicitly chose to run Armor instead of their Primary 2 weapon
+    allowedWeaponIndices.delete(p2Idx);
+    armorHp = HEAVY_ARMOR_HP;
+    if (currentIndex === p2Idx) currentIndex = secIdx;
+    armorFlipEl.textContent = `Running Armor instead of ${WEAPON_CONFIGS[p2Idx].name}: +${HEAVY_ARMOR_HP} armor (non-regenerating).`;
+  } else {
+    armorFlipEl.textContent = '';
+  }
+  if (armorFlipEl.textContent) {
+    armorFlipEl.style.display = 'block';
+    setTimeout(() => { armorFlipEl.style.display = 'none'; }, 3500);
+  }
+
+  if (loadoutOnConfirm) loadoutOnConfirm();
 });
 
 // PHYSICS & MOVEMENT
@@ -641,7 +949,7 @@ function movePlayer(delta) {
     _forward.normalize();
   }
 
-  let speed = MOVE_SPEED;
+  let speed = MOVE_SPEED * computeSpeedMultiplier();
   if (keys['ShiftLeft'] || keys['ShiftRight']) speed *= SPRINT_MULTIPLIER;
 
   _wish.set(0, 0, 0)
@@ -676,7 +984,7 @@ function movePlayer(delta) {
 
   currentHeight = THREE.MathUtils.lerp(currentHeight, targetHeight, delta * 12);
   const crouching = currentHeight < STAND_HEIGHT - 0.15;
-  if (crouching) speed = MOVE_SPEED * CROUCH_SPEED_MULTIPLIER;
+  if (crouching) speed = MOVE_SPEED * CROUCH_SPEED_MULTIPLIER * computeSpeedMultiplier();
 
   moveState.moving = _wish.lengthSq() > 0 && grounded;
   moveState.sprinting = (keys['ShiftLeft'] || keys['ShiftRight']) && !crouching;
@@ -722,15 +1030,29 @@ function movePlayer(delta) {
   sunGroup.position.set(playerPos.x + 450, playerPos.y + 750, playerPos.z + 250);
 }
 
+let scoreboardRefreshTimer = 0;
+
 // MAIN LOOP & OFFSETS
 function animate() {
   requestAnimationFrame(animate);
   const delta = Math.min(clock.getDelta(), 0.1); 
 
+  // TICK THE TARGET TRACKER
   myTarget.update();
 
+  if (isDead) {
+    if (performance.now() / 1000 >= respawnAt && !awaitingLoadoutPick) {
+      awaitingLoadoutPick = true;
+      openLoadoutScreen(() => actuallyRespawn());
+    }
+    updateHud();
+  } else if (playerHp < effectiveMaxHp && (performance.now() / 1000 - lastDamageTime) >= HP_REGEN_DELAY) {
+    playerHp = Math.min(effectiveMaxHp, playerHp + HP_REGEN_RATE * getRegenRateMultiplier() * delta);
+    updateHud();
+  }
+
   if (network) {
-    network.update(delta, playerPos, cameraGroup.rotation.y, currentIndex, playerHp);
+    network.update(delta, playerPos, cameraGroup.rotation.y, currentIndex, playerHp, moveState.crouching, currentLean, computeScaleMultiplier());
   }
 
   if (controls.isLocked) {
@@ -771,14 +1093,17 @@ function animate() {
   recoilX = THREE.MathUtils.lerp(recoilX, targetRecoilX, delta * 20);
   recoilY = THREE.MathUtils.lerp(recoilY, targetRecoilY, delta * 20);
 
+  // 1. Primary physical camera modifications (World Layer Viewport)
   camera.position.set(leanOffsetAmt + bobHoriz, bobVert, 0);
   camera.rotation.set(recoilX, recoilY, currentLean, 'YXZ');
 
+  // FIXED: Keep the viewmodel overlay camera cleanly isolated at the origin.
   viewmodelCamera.position.set(0, 0, 0);
   viewmodelCamera.rotation.set(0, 0, 0);
 
   const adsModifier = scoped ? 0.0 : 1.0; 
 
+  // 2. Viewmodel Position Secondary Offsets (Sway lag, movement inertias, recoil kick)
   let vmX = -swayX * 0.4 * adsModifier;       
   let vmY = swayY * 0.4 * adsModifier;
   let vmZ = recoilX * -0.3; 
@@ -789,6 +1114,7 @@ function animate() {
 
   weaponRig.position.set(vmX, vmY, vmZ);
 
+  // 3. Viewmodel Rotation Secondary Offsets (Sway twisting, weapon shooting snaps, procedural lean)
   let rotX = swayY * 0.12 * adsModifier;      
   let rotY = -swayX * 0.12 * adsModifier;
   let rotZ = currentLean * 1.0 * adsModifier;                   
@@ -817,7 +1143,7 @@ function animate() {
 
   if (controls.isLocked && leftMouseDown && w.loaded && w.cfg.fireMode === 'auto') {
     w.fireTimer += delta;
-    const interval = 1 / (w.cfg.fireRate || 8);
+    const interval = 1 / ((w.cfg.fireRate || 8) * getFireRateMultiplier(w.cfg));
     while (w.fireTimer >= interval) { w.fireTimer -= interval; tryShoot(); }
   }
 
@@ -831,6 +1157,20 @@ function animate() {
   }
 
   playerHitbox.visible = settings.visiblePlayer;
+
+  const gameMenuEl = document.getElementById('game-menu');
+  if (gameMenuEl && gameMenuEl.style.display !== 'none') {
+    scoreboardRefreshTimer += delta;
+    if (scoreboardRefreshTimer >= 0.5) {
+      scoreboardRefreshTimer = 0;
+      const rows = network ? network.getScoreboard() : [];
+      updateScoreboard(rows, isAdmin, (targetUid) => {
+        if (confirm('Ban this player? They will be blocked from logging in again.')) {
+          banPlayer(targetUid).catch((err) => alert('Ban failed: ' + err.message));
+        }
+      });
+    }
+  }
 
   sunGroup.children.forEach(sprite => {
     sprite.lookAt(cameraGroup.position);
@@ -846,11 +1186,14 @@ function animate() {
     }
   }
 
+  // OPTIMIZED: SINGLE-PASS DEPTH LAYERING (Eliminates Double Render)
   renderer.setRenderTarget(null);
   renderer.clear(true, true, true);
 
+  // Pass 1: Render the main world environment
   renderer.render(scene, camera);
 
+  // Pass 2: Isolate the weapon overlay depth layer to prevent clipping
   renderer.clearDepth();
   renderer.render(viewmodelScene, viewmodelCamera);
 }
@@ -870,20 +1213,64 @@ function drawRemoteTracer(originArr, dirArr) {
   activeTracers.push({ mesh: line, life: 1, permanent: false });
 }
 
-function startNetwork(serverUrl, playerName) {
-  // Graceful browser-level check
-  if (window.location.protocol === 'https:' && serverUrl.startsWith('ws://')) {
-    console.warn("[net] Proactive Warning: Browsers typically block insecure ws:// connections on HTTPS setups.");
-  }
+function startNetwork(uid, playerName, room, adminFlag) {
+  myUid = uid;
+  myDisplayName = playerName;
+  isAdmin = adminFlag;
+  setAdminMode(isAdmin);
 
   network = createNetworkSystem({
     scene,
-    serverUrl,
-    playerName: playerName || 'Player',
+    uid,
+    playerName,
+    room,
     eyeHeight: STAND_HEIGHT,
-    onLocalPlayerHit: (fromId, damage) => {
-      playerHp = Math.max(0, playerHp - damage);
+    onLocalPlayerHit: (fromId, fromName, damage, isHeadshot, bodyEquivalentDamage) => {
+      if (isDead) return;
+
+      let finalDamage = damage;
+
+      // Florida Man: immune to headshot bonus damage - take the body-equivalent instead
+      if (isHeadshot && currentSpecial && currentSpecial.id === 'florida' && typeof bodyEquivalentDamage === 'number') {
+        finalDamage = bodyEquivalentDamage;
+      }
+
+      // General damage reduction (Florida Man's passive)
+      if (currentSpecial && currentSpecial.damageTakenMult) {
+        finalDamage *= currentSpecial.damageTakenMult;
+      }
+
+      // Lucky: 10% chance to survive a lethal blow at 1 HP, once per life
+      if (
+        playerHp - finalDamage <= 0 &&
+        currentSpecial && currentSpecial.id === 'lucky' &&
+        !usedLuckySurvive &&
+        Math.random() < currentSpecial.surviveLethalChance
+      ) {
+        usedLuckySurvive = true;
+        playerHp = 1;
+        lastDamageTime = performance.now() / 1000;
+        flashDamage(finalDamage);
+        updateHud();
+        return;
+      }
+
+      // Heavy's armor (if the coinflip granted it) absorbs damage first, doesn't regen
+      if (armorHp > 0) {
+        const absorbed = Math.min(armorHp, finalDamage);
+        armorHp -= absorbed;
+        finalDamage -= absorbed;
+      }
+
+      playerHp = Math.max(0, playerHp - finalDamage);
+      lastDamageTime = performance.now() / 1000;
+      flashDamage(finalDamage);
+      if (playerHp <= 0) die(fromName);
       updateHud();
+    },
+    onKillFeed: (killerName, victimName) => {
+      pushKillFeed(`${killerName} killed ${victimName}`);
+      if (killerName === myDisplayName) network.registerLocalKill();
     },
     onRemoteShot: (id, origin, dir) => {
       drawRemoteTracer(origin, dir);
@@ -892,39 +1279,96 @@ function startNetwork(serverUrl, playerName) {
 }
 
 const mpLogin = document.getElementById('mp-login');
-const mpConnectBtn = document.getElementById('mp-connect-btn');
+const authPanel = document.getElementById('mp-auth-panel');
+const roomPanel = document.getElementById('mp-room-panel');
+const tabLogin = document.getElementById('mp-tab-login');
+const tabSignup = document.getElementById('mp-tab-signup');
+const emailInput = document.getElementById('mp-email');
+const passwordInput = document.getElementById('mp-password');
+const authError = document.getElementById('mp-auth-error');
+const authSubmitBtn = document.getElementById('mp-auth-submit');
+const mpSoloBtn = document.getElementById('mp-solo-btn');
+const welcomeNameEl = document.getElementById('mp-welcome-name');
+const displayNameInput = document.getElementById('mp-display-name');
+const roomListEl = document.getElementById('mp-room-list');
 
-mpConnectBtn.addEventListener('click', () => {
-  const name = document.getElementById('mp-name').value.trim() || 'Player';
-  const url = document.getElementById('mp-url').value.trim();
-  
-  if (url) {
-    startNetwork(url, name);
-  }
-  
-  mpLogin.style.display = 'none';
-  // Instantly dispatch direct user-interaction lock to capture pointer
-  setTimeout(() => { controls.lock(); }, 100);
+let authMode = 'login';
+tabLogin.addEventListener('click', () => {
+  authMode = 'login';
+  tabLogin.classList.add('active'); tabSignup.classList.remove('active');
+  authSubmitBtn.textContent = 'LOG IN';
+});
+tabSignup.addEventListener('click', () => {
+  authMode = 'signup';
+  tabSignup.classList.add('active'); tabLogin.classList.remove('active');
+  authSubmitBtn.textContent = 'SIGN UP';
 });
 
-// Programmatically build a "Play Offline" option to fix Single Player logic loops
-const spPlayBtn = document.createElement('button');
-spPlayBtn.id = 'sp-play-btn';
-spPlayBtn.textContent = 'Play Offline (Single Player)';
-spPlayBtn.style.cssText = 'margin-top: 12px; width: 100%; padding: 10px; font-weight: bold; cursor: pointer; border-radius: 4px; border: 1px solid #444; background: #eee;';
+let pendingUid = null, pendingIsAdmin = false;
 
-if (mpConnectBtn && mpConnectBtn.parentNode) {
-  mpConnectBtn.parentNode.appendChild(spPlayBtn);
+authSubmitBtn.addEventListener('click', async () => {
+  authError.textContent = '';
+  authSubmitBtn.disabled = true;
+  authSubmitBtn.textContent = 'Please wait...';
+  try {
+    const { uid, isAdmin: adminFlag } = await loginOrSignUp(emailInput.value.trim(), passwordInput.value, authMode);
+    pendingUid = uid;
+    pendingIsAdmin = adminFlag;
+    welcomeNameEl.textContent = emailInput.value.trim();
+    authPanel.style.display = 'none';
+    roomPanel.style.display = 'flex';
+    await populateRoomList();
+  } catch (err) {
+    authError.textContent = err.message || 'Something went wrong.';
+  } finally {
+    authSubmitBtn.disabled = false;
+    authSubmitBtn.textContent = authMode === 'login' ? 'LOG IN' : 'SIGN UP';
+  }
+});
+
+async function populateRoomList() {
+  roomListEl.innerHTML = 'Loading server list...';
+  const counts = await fetchRoomCounts(ROOMS).catch(() => ({}));
+  roomListEl.innerHTML = '';
+  ROOMS.forEach((room) => {
+    const btn = document.createElement('button');
+    btn.className = 'room-btn';
+    const count = counts[room] ?? '?';
+    btn.innerHTML = `<span>${room}</span><span>${count} online</span>`;
+    btn.addEventListener('click', () => {
+      const name = displayNameInput.value.trim() || 'Player';
+      startNetwork(pendingUid, name, room, pendingIsAdmin);
+      mpLogin.style.display = 'none';
+      openLoadoutScreen(() => actuallyRespawn());
+    });
+    roomListEl.appendChild(btn);
+  });
 }
 
-spPlayBtn.addEventListener('click', () => {
-  console.log("[game] Initializing local single player environment...");
-  network = null; 
+mpSoloBtn.addEventListener('click', () => {
+  isAdmin = true; // solo/offline play - no one else around, debug tools are fine
+  setAdminMode(isAdmin);
   mpLogin.style.display = 'none';
-  updateHud();
-  // Call Pointer Lock directly inside user context loop
-  controls.lock();
+  openLoadoutScreen(() => actuallyRespawn());
 });
+
+// -----------------------------
+// LOADING SCREEN
+// -----------------------------
+const loadingScreen = document.getElementById('loading-screen');
+const loadingBar = document.getElementById('loading-bar');
+const TOTAL_ASSETS_TO_LOAD = WEAPON_CONFIGS.length + 1; // weapons + map
+let assetsLoaded = 0;
+
+function reportAssetLoaded() {
+  assetsLoaded++;
+  const pct = Math.min(100, Math.round((assetsLoaded / TOTAL_ASSETS_TO_LOAD) * 100));
+  loadingBar.style.width = pct + '%';
+  if (assetsLoaded >= TOTAL_ASSETS_TO_LOAD) {
+    loadingScreen.style.display = 'none';
+    mpLogin.style.display = 'flex';
+  }
+}
 
 // KICK OFF
 setHud(['Loading weapons and map...']);
