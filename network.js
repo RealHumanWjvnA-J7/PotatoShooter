@@ -1,28 +1,21 @@
 import * as THREE from 'three';
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js';
 import {
+  getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+} from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js';
+import {
   getDatabase, ref, set, update, remove, onValue, onDisconnect,
   push, onChildAdded, serverTimestamp, get,
 } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-database.js';
 
 // -----------------------------
-// MULTIPLAYER NETWORK MODULE (Firebase Realtime Database backend)
+// MULTIPLAYER NETWORK MODULE (Firebase Auth + Realtime Database backend)
 // -----------------------------
-// This replaces the old WebSocket relay (server.js) entirely. Firebase's
-// free "Spark" tier hosts the realtime sync for you - no server to run,
-// no ngrok, no port forwarding. Every player's browser talks directly to
-// Firebase, and Firebase fans the updates out to everyone else.
+// Free Firebase Spark tier. No server to run. See FIREBASE_GITHUB_SETUP.txt
+// for one-time console setup (enabling Auth, Realtime Database, rules).
 //
-// SETUP (one-time, see FIREBASE_SETUP.txt for full steps):
-//   1. Create a free Firebase project at https://console.firebase.google.com
-//   2. Enable "Realtime Database" (not Firestore) in test/locked mode
-//   3. Paste your project's config into FIREBASE_CONFIG below
-//   4. Set the database rules from FIREBASE_SETUP.txt
-//
-// NOTE: it's normal and expected for this config object to be public/
-// hardcoded in client-side code - that's how Firebase web apps always
-// work. Access control is enforced by the Database Rules you set in the
-// Firebase console, not by hiding these values.
+// NOTE: it's normal for this config object to be public in client code -
+// access control is enforced by Database Rules, not by hiding these values.
 // -----------------------------
 
 const FIREBASE_CONFIG = {
@@ -34,31 +27,73 @@ const FIREBASE_CONFIG = {
 
 const STATE_SEND_HZ = 15;
 const INTERP_SPEED = 12;
-const STALE_PLAYER_MS = 10000; // if a player's data hasn't updated in this long, drop them locally
+const STALE_PLAYER_MS = 10000;
+
+const app = initializeApp(FIREBASE_CONFIG);
+const auth = getAuth(app);
+const db = getDatabase(app);
+
+/**
+ * Creates or logs into an account. Returns { uid, isAdmin } on success,
+ * throws with a readable .message on failure (bad password, banned, etc).
+ */
+export async function loginOrSignUp(email, password, mode /* 'login' | 'signup' */) {
+  let cred;
+  if (mode === 'signup') {
+    cred = await createUserWithEmailAndPassword(auth, email, password);
+  } else {
+    cred = await signInWithEmailAndPassword(auth, email, password);
+  }
+  const uid = cred.user.uid;
+
+  const bannedSnap = await get(ref(db, `banned/${uid}`));
+  if (bannedSnap.exists()) {
+    throw new Error('This account has been suspended.');
+  }
+
+  const adminSnap = await get(ref(db, `admins/${uid}`));
+  const isAdmin = adminSnap.exists() && adminSnap.val() === true;
+  return { uid, isAdmin };
+}
+
+/** Reads player counts for every room, for the room-select screen. */
+export async function fetchRoomCounts(rooms) {
+  const counts = {};
+  await Promise.all(rooms.map(async (room) => {
+    const snap = await get(ref(db, `players/${room}`));
+    counts[room] = snap.exists() ? Object.keys(snap.val()).length : 0;
+  }));
+  return counts;
+}
+
+/** Admin-only: ban a uid. Enforced server-side by database rules - will
+ *  fail silently (permission denied) if the caller isn't a real admin. */
+export function banPlayer(uid) {
+  return set(ref(db, `banned/${uid}`), true);
+}
 
 /**
  * @param {object} deps
  * @param {THREE.Scene} deps.scene
+ * @param {string} deps.uid
  * @param {string} deps.playerName
- * @param {(fromId: string, damage: number) => void} deps.onLocalPlayerHit
+ * @param {string} deps.room
+ * @param {(fromId: string, fromName: string, damage: number) => void} deps.onLocalPlayerHit
+ * @param {(killerName: string, victimName: string) => void} deps.onKillFeed
  * @param {(id: string, origin: number[], dir: number[], weaponIndex: number) => void} deps.onRemoteShot
  * @param {number} [deps.eyeHeight=1.8]
  */
 export function createNetworkSystem(deps) {
-  const { scene, playerName, onLocalPlayerHit, onRemoteShot, eyeHeight = 1.8 } = deps;
+  const { scene, uid, playerName, room, onLocalPlayerHit, onKillFeed, onRemoteShot, eyeHeight = 1.8 } = deps;
 
-  const app = initializeApp(FIREBASE_CONFIG);
-  const db = getDatabase(app);
-
-  const myId = push(ref(db, 'players')).key; // generate a unique id up front
-  const myPlayerRef = ref(db, `players/${myId}`);
-  const eventsRef = ref(db, 'events');
+  const myPlayerRef = ref(db, `players/${room}/${uid}`);
+  const eventsRef = ref(db, `events/${room}`);
 
   let connected = false;
   let latestLocalState = null;
   const seenEventKeys = new Set();
 
-  /** @type {Map<string, { root, nameSprite, targetPos, targetRotY, hp, name, lastUpdate }>} */
+  /** @type {Map<string, { root, nameSprite, body, targetPos, targetRotY, targetCrouch, targetLean, hp, name, kills, deaths, lastUpdate }>} */
   const remotePlayers = new Map();
 
   function makeNameSprite(name) {
@@ -102,22 +137,25 @@ export function createNetworkSystem(deps) {
     root.add(nameSprite);
 
     scene.add(root);
-    return { root, nameSprite };
+    return { root, nameSprite, body };
   }
 
   function addOrUpdateRemotePlayer(id, data) {
-    if (id === myId || !data) return;
+    if (id === uid || !data) return;
     const pos = data.pos || [50, eyeHeight, 0];
     const feetY = pos[1] - eyeHeight;
 
     if (!remotePlayers.has(id)) {
-      const { root, nameSprite } = makeRemotePlayerMesh(data.name || 'Player', id);
+      const { root, nameSprite, body } = makeRemotePlayerMesh(data.name || 'Player', id);
       root.position.set(pos[0], feetY, pos[2]);
       remotePlayers.set(id, {
-        root, nameSprite,
+        root, nameSprite, body,
         targetPos: new THREE.Vector3(pos[0], feetY, pos[2]),
         targetRotY: data.rotY || 0,
+        targetCrouch: data.crouch ? 1 : 0,
+        targetLean: data.lean || 0,
         hp: data.hp, name: data.name,
+        kills: data.kills || 0, deaths: data.deaths || 0,
         lastUpdate: Date.now(),
       });
       console.log(`[net] spawned remote player "${data.name}" (${id})`);
@@ -125,7 +163,11 @@ export function createNetworkSystem(deps) {
       const rp = remotePlayers.get(id);
       rp.targetPos.set(pos[0], feetY, pos[2]);
       rp.targetRotY = data.rotY || 0;
+      rp.targetCrouch = data.crouch ? 1 : 0;
+      rp.targetLean = data.lean || 0;
       rp.hp = data.hp;
+      rp.kills = data.kills || 0;
+      rp.deaths = data.deaths || 0;
       rp.lastUpdate = Date.now();
     }
   }
@@ -142,31 +184,30 @@ export function createNetworkSystem(deps) {
     remotePlayers.delete(id);
   }
 
-  async function connect() {
-    console.log('[net] connecting to Firebase...');
+  let myKills = 0, myDeaths = 0;
 
-    // Announce ourselves, and make sure our node auto-deletes if we
-    // close the tab, lose power, whatever - no server-side timeout
-    // logic needed, Firebase handles this natively.
+  async function connect() {
+    console.log(`[net] connecting to room "${room}" as ${playerName} (${uid})...`);
+
     await set(myPlayerRef, {
       name: playerName,
       pos: [50, eyeHeight, 0],
-      rotY: 0,
+      rotY: 0, crouch: false, lean: 0,
       weaponIndex: 0,
       hp: 150,
+      kills: 0, deaths: 0,
       updatedAt: serverTimestamp(),
     });
     onDisconnect(myPlayerRef).remove();
 
     connected = true;
-    console.log(`[net] connected as ${myId}`);
+    console.log(`[net] connected`);
 
-    // Listen for the full roster of players
-    onValue(ref(db, 'players'), (snapshot) => {
+    onValue(ref(db, `players/${room}`), (snapshot) => {
       const all = snapshot.val() || {};
       const seen = new Set();
       for (const [id, data] of Object.entries(all)) {
-        if (id === myId) continue;
+        if (id === uid) continue;
         seen.add(id);
         addOrUpdateRemotePlayer(id, data);
       }
@@ -175,23 +216,21 @@ export function createNetworkSystem(deps) {
       }
     });
 
-    // Listen for shoot/hit events (a shared append-only list, pruned as we go)
     onChildAdded(eventsRef, (snapshot) => {
       const key = snapshot.key;
       const evt = snapshot.val();
       if (!evt || seenEventKeys.has(key)) return;
       seenEventKeys.add(key);
 
-      if (evt.type === 'shoot' && evt.from !== myId) {
+      if (evt.type === 'shoot' && evt.from !== uid) {
         if (onRemoteShot) onRemoteShot(evt.from, evt.origin, evt.dir, evt.weaponIndex);
-      } else if (evt.type === 'hit' && evt.targetId === myId) {
-        if (onLocalPlayerHit) onLocalPlayerHit(evt.from, evt.damage);
+      } else if (evt.type === 'hit' && evt.targetId === uid) {
+        if (onLocalPlayerHit) onLocalPlayerHit(evt.from, evt.fromName, evt.damage);
+      } else if (evt.type === 'death') {
+        if (onKillFeed) onKillFeed(evt.killerName, evt.victimName);
       }
 
-      // Clean up old events lazily so the list doesn't grow forever.
-      // (Simple approach: remove it once we've processed it. Fine for a
-      // small friend group - if you ever need replay/history, don't do this.)
-      remove(ref(db, `events/${key}`)).catch(() => {});
+      remove(ref(db, `events/${room}/${key}`)).catch(() => {});
     });
   }
 
@@ -202,8 +241,6 @@ export function createNetworkSystem(deps) {
     update(myPlayerRef, { ...latestLocalState, updatedAt: serverTimestamp() }).catch(() => {});
   }, 1000 / STATE_SEND_HZ);
 
-  // Safety net: prune remote players we haven't heard from in a while,
-  // in case an onDisconnect didn't fire cleanly (e.g. hard crash).
   setInterval(() => {
     const now = Date.now();
     for (const [id, rp] of remotePlayers) {
@@ -212,18 +249,28 @@ export function createNetworkSystem(deps) {
   }, 3000);
 
   return {
-    update(delta, playerPos, cameraRotY, weaponIndex, hp) {
+    update(delta, playerPos, cameraRotY, weaponIndex, hp, crouching, leanAmt) {
       latestLocalState = {
         pos: [playerPos.x, playerPos.y, playerPos.z],
         rotY: cameraRotY,
+        crouch: !!crouching,
+        lean: leanAmt || 0,
         weaponIndex,
         hp,
+        kills: myKills,
+        deaths: myDeaths,
       };
 
       const t = Math.min(1, delta * INTERP_SPEED);
       for (const rp of remotePlayers.values()) {
         rp.root.position.lerp(rp.targetPos, t);
         rp.root.rotation.y = THREE.MathUtils.lerp(rp.root.rotation.y, rp.targetRotY, t);
+        rp.root.rotation.z = THREE.MathUtils.lerp(rp.root.rotation.z, rp.targetLean, t);
+
+        const targetScaleY = rp.targetCrouch ? 0.72 : 1.0;
+        rp.body.scale.y = THREE.MathUtils.lerp(rp.body.scale.y, targetScaleY, t);
+        const heightDrop = (1.0 - rp.body.scale.y) * eyeHeight * 0.5;
+        rp.nameSprite.position.y = 2.2 - heightDrop;
       }
     },
 
@@ -231,7 +278,7 @@ export function createNetworkSystem(deps) {
       if (!connected) return;
       push(eventsRef, {
         type: 'shoot',
-        from: myId,
+        from: uid,
         origin: [originVec3.x, originVec3.y, originVec3.z],
         dir: [dirVec3.x, dirVec3.y, dirVec3.z],
         weaponIndex,
@@ -240,12 +287,29 @@ export function createNetworkSystem(deps) {
 
     sendHit(targetId, damage) {
       if (!connected) return;
-      push(eventsRef, { type: 'hit', from: myId, targetId, damage }).catch(() => {});
+      push(eventsRef, { type: 'hit', from: uid, fromName: playerName, targetId, damage }).catch(() => {});
+    },
+
+    /** Call when the LOCAL player dies, naming who killed them (or null if environmental/unknown). */
+    sendDeath(killerName) {
+      myDeaths++;
+      if (!connected) return;
+      push(eventsRef, { type: 'death', killerName: killerName || 'the environment', victimName: playerName }).catch(() => {});
+    },
+
+    /** Call when the local player's shot kills someone else, for the local kill counter. */
+    registerLocalKill() {
+      myKills++;
     },
 
     getRemotePlayers() { return remotePlayers; },
     getRemotePlayerMeshes() { return [...remotePlayers.values()].map(rp => rp.root); },
+    getScoreboard() {
+      const rows = [...remotePlayers.entries()].map(([id, rp]) => ({ uid: id, name: rp.name, kills: rp.kills, deaths: rp.deaths }));
+      rows.push({ uid: null, name: playerName + ' (you)', kills: myKills, deaths: myDeaths });
+      return rows.sort((a, b) => b.kills - a.kills);
+    },
     isConnected() { return connected; },
-    getMyId() { return myId; },
+    getMyId() { return uid; },
   };
 }

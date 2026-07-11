@@ -86,10 +86,10 @@ export const WEAPON_CONFIGS = [
     magSize: 40,
     fireMode: 'auto',
     fireRate: 25,  
-    damage: 2,
+    damage: 1.5,
     position: [0.09, -0.85, -0.75],
     rotation: [0, Math.PI, 0],
-    scopedPosition: [-0.28, -0.75, -0.65],
+    scopedPosition: [-0.28, -0.38, -0.65],
     scopedRotation: [0, Math.PI, 0],
     scopedFov: 50,
     scopedSensitivity: 0.60,
@@ -112,6 +112,8 @@ export const WEAPON_CONFIGS = [
     recoilX: 0.05
   }
 ];
+
+export const ROOMS = ['Server 1', 'Server 2', 'Server 3', 'Server 4', 'Server 5'];
 
 export const MAX_HP = 150;
 

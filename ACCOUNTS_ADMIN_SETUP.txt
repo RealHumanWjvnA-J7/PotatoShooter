@@ -1,0 +1,109 @@
+ACCOUNTS, ADMIN, BANS, ROOMS - SETUP
+======================================
+This is on top of the original Firebase + GitHub Pages setup. Do these
+steps once.
+
+-----------------------------------------------------------------
+PART 1 - ENABLE EMAIL/PASSWORD SIGN-IN
+-----------------------------------------------------------------
+1. https://console.firebase.google.com -> your project
+2. Left sidebar: Build -> Authentication
+3. Click "Get started" if you haven't already
+4. Click "Email/Password" in the sign-in methods list -> toggle it ON -> Save
+
+-----------------------------------------------------------------
+PART 2 - UPDATE YOUR DATABASE RULES
+-----------------------------------------------------------------
+Realtime Database -> Rules tab -> replace everything with:
+
+{
+  "rules": {
+    "players": {
+      "$room": {
+        "$uid": {
+          ".read": true,
+          ".write": "auth != null && auth.uid == $uid"
+        }
+      }
+    },
+    "events": {
+      "$room": {
+        ".read": true,
+        ".write": "auth != null"
+      }
+    },
+    "banned": {
+      ".read": true,
+      ".write": "auth != null && root.child('admins').child(auth.uid).val() == true"
+    },
+    "admins": {
+      ".read": true,
+      ".write": false
+    }
+  }
+}
+
+Click Publish.
+
+WHY THIS MATTERS: the ".write" rules above run on Google's servers, not
+in the browser. That's what makes the admin/ban system real instead of
+just hidden UI - even if someone opens dev tools and tries to call the
+ban function directly, Firebase itself will reject the write unless
+their account's UID is actually listed under /admins with value `true`.
+The "admins" node has ".write": false for everyone, including admins -
+you can only add admins by editing the database directly in the
+Firebase console (Part 4 below), never from the app itself. That's
+intentional - it means there's no code path, bug, or exploit that lets
+someone grant themselves admin.
+
+-----------------------------------------------------------------
+PART 3 - CREATE YOUR OWN ACCOUNT
+-----------------------------------------------------------------
+1. Open your game (locally or via GitHub Pages once deployed)
+2. On the login screen, click "SIGN UP"
+3. Enter an email + password (any email works, doesn't need to be a
+   real inbox you check, but don't reuse a password from somewhere
+   important since this is just a hobby project's auth system)
+4. Click SIGN UP - you'll land on the room-select screen once it works
+
+-----------------------------------------------------------------
+PART 4 - MAKE YOURSELF ADMIN
+-----------------------------------------------------------------
+1. Firebase console -> Authentication -> Users tab
+2. Find the account you just created, copy its "User UID" column value
+3. Realtime Database -> Data tab
+4. Hover over the root, click the "+" to add a child node
+5. Name: admins -> Add
+6. Under admins, add another child: name = paste your UID, value = true
+   (make sure the value's type dropdown is set to "boolean", not "string")
+7. Done. Next time you log in with that account, you'll get admin
+   powers: noclip ([ key), freecam (] key), debug tracers/wireframe
+   toggles in the settings menu, and a BAN button next to other players'
+   names in the Tab scoreboard.
+
+NOTE: admin status is checked once at login. If you add yourself as
+admin while already logged in, refresh/re-login to pick it up.
+
+-----------------------------------------------------------------
+BANNING SOMEONE
+-----------------------------------------------------------------
+Press Tab in-game, find their name in the scoreboard, click BAN, confirm
+the popup. This blocks that account from logging in again (checked at
+login time). It does NOT immediately kick them from an active session -
+Firebase's free tier doesn't give us a way to forcibly disconnect
+someone mid-session without running your own server, so a banned player
+already in a match will stay until they leave/refresh, then can't get
+back in. Good enough for a friend group; not built for handling an
+actively hostile stranger in real time.
+
+You can also ban manually: Realtime Database -> Data -> add a child
+under "banned" with their UID as the key and `true` as the value.
+
+-----------------------------------------------------------------
+ROOMS / SERVERS
+-----------------------------------------------------------------
+5 rooms ("Server 1" through "Server 5") are hardcoded in config.js
+(ROOMS array). Each room is a fully separate match - players, events,
+and kill feeds don't cross between rooms. The room-select screen shows
+live player counts per room before you pick. To change the number/names
+of rooms, edit the ROOMS array in config.js.

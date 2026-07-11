@@ -8,11 +8,11 @@ import {
   HP_REGEN_DELAY, HP_REGEN_RATE, RESPAWN_DELAY, SPAWN_POINTS,
   MOVE_SPEED, SPRINT_MULTIPLIER, CROUCH_SPEED_MULTIPLIER, JUMP_SPEED, GRAVITY,
   STAND_HEIGHT, CROUCH_HEIGHT, PLAYER_RADIUS, LEAN_ANGLE, LEAN_OFFSET,
-  BOB_SMOOTHING, BOB_PROFILES,
+  BOB_SMOOTHING, BOB_PROFILES, ROOMS,
 } from './config.js';
 import { createUISystem } from './ui.js';
 import { TargetCube } from './targetCube.js'; // IMPORTED TARGET CUBE
-import { createNetworkSystem } from './network.js';
+import { createNetworkSystem, loginOrSignUp, fetchRoomCounts, banPlayer } from './network.js';
 
 // ENGINE SETTINGS
 let playerHp = 150;
@@ -30,7 +30,10 @@ const settings = {
   bobIntensity: 2
 };
 
-let network = null; // set up once the player clicks PLAY on the connect overlay
+let network = null; // set up once the player picks a room on the connect overlay
+let isAdmin = false;
+let myUid = null;
+let myDisplayName = 'Player';
 
 let noclip = false;
 let freecam = false;
@@ -115,7 +118,7 @@ scene.add(playerHitbox);
 const activeTracers = [];
 const controls = new PointerLockControls(cameraGroup, document.body);
 
-const { toggleMenu, applyGraphicsSettings, sunGroup } = createUISystem({
+const { toggleMenu, applyGraphicsSettings, sunGroup, updateScoreboard, setAdminMode } = createUISystem({
   scene, sun, renderer, settings, GRAPHICS_PROFILES, ANTI_ALIASING_TIERS,
   getCollidables: () => collidables,
   activeTracers,
@@ -332,9 +335,10 @@ function loadWeaponAssets(index) {
       
       w.loaded = true;
       updateHud();
+      reportAssetLoaded();
     },
     undefined,
-    (err) => { console.error(`Failed to load weapon:`, err); updateHud(); }
+    (err) => { console.error(`Failed to load weapon:`, err); updateHud(); reportAssetLoaded(); }
   );
 }
 
@@ -359,10 +363,12 @@ function loadMap(path) {
       collidables.push(myTarget.mesh);
       
       applyGraphicsSettings();
+      reportAssetLoaded();
     },
     undefined,
     (err) => { 
       collidables = [fallbackGround, myTarget.mesh]; 
+      reportAssetLoaded();
     }
   );
 }
@@ -574,8 +580,12 @@ document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Tab') { e.preventDefault(); toggleMenu(); return; }
-  if (e.code === 'BracketLeft') { noclip = !noclip; if (noclip) { verticalVelocity = 0; grounded = true; } updateHud(); return; }
-  if (e.code === 'BracketRight') { freecam = !freecam; if (freecam) freecamPos.copy(cameraGroup.position); updateHud(); return; }
+  if (!isAdmin) {
+    if (e.code === 'BracketLeft' || e.code === 'BracketRight') return; // debug tools, admin only
+  } else {
+    if (e.code === 'BracketLeft') { noclip = !noclip; if (noclip) { verticalVelocity = 0; grounded = true; } updateHud(); return; }
+    if (e.code === 'BracketRight') { freecam = !freecam; if (freecam) freecamPos.copy(cameraGroup.position); updateHud(); return; }
+  }
 
   if (!controls.isLocked) return;
   switch (e.code) {
@@ -617,15 +627,37 @@ window.addEventListener('resize', () => {
 });
 
 // -----------------------------
+// DAMAGE FEEDBACK / KILL FEED
+// -----------------------------
+const damageVignette = document.getElementById('damage-vignette');
+function flashDamage(amount) {
+  const intensity = Math.min(1, amount / 40); // scales with hit size, caps out
+  damageVignette.style.boxShadow = `inset 0 0 ${80 + intensity * 60}px ${20 + intensity * 20}px rgba(255,0,0,${0.35 + intensity * 0.35})`;
+  clearTimeout(flashDamage._t);
+  flashDamage._t = setTimeout(() => { damageVignette.style.boxShadow = 'inset 0 0 0 0 rgba(255,0,0,0)'; }, 220);
+}
+
+const killFeedEl = document.getElementById('kill-feed');
+function pushKillFeed(text) {
+  const line = document.createElement('div');
+  line.textContent = text;
+  killFeedEl.appendChild(line);
+  setTimeout(() => { line.style.opacity = '0'; }, 4000);
+  setTimeout(() => { line.remove(); }, 6000);
+  while (killFeedEl.children.length > 5) killFeedEl.removeChild(killFeedEl.firstChild);
+}
+
+// -----------------------------
 // HP / DEATH / RESPAWN
 // -----------------------------
-function die() {
+function die(killerName = null) {
   if (isDead) return;
   isDead = true;
   playerHp = 0;
   respawnAt = performance.now() / 1000 + RESPAWN_DELAY;
   leftMouseDown = false;
   if (controls.isLocked) controls.unlock();
+  if (network) network.sendDeath(killerName);
   updateHud();
 }
 
@@ -763,6 +795,8 @@ function movePlayer(delta) {
   sunGroup.position.set(playerPos.x + 450, playerPos.y + 750, playerPos.z + 250);
 }
 
+let scoreboardRefreshTimer = 0;
+
 // MAIN LOOP & OFFSETS
 function animate() {
   requestAnimationFrame(animate);
@@ -780,7 +814,7 @@ function animate() {
   }
 
   if (network) {
-    network.update(delta, playerPos, cameraGroup.rotation.y, currentIndex, playerHp);
+    network.update(delta, playerPos, cameraGroup.rotation.y, currentIndex, playerHp, moveState.crouching, currentLean);
   }
 
   if (controls.isLocked) {
@@ -886,6 +920,20 @@ function animate() {
 
   playerHitbox.visible = settings.visiblePlayer;
 
+  const gameMenuEl = document.getElementById('game-menu');
+  if (gameMenuEl && gameMenuEl.style.display !== 'none') {
+    scoreboardRefreshTimer += delta;
+    if (scoreboardRefreshTimer >= 0.5) {
+      scoreboardRefreshTimer = 0;
+      const rows = network ? network.getScoreboard() : [];
+      updateScoreboard(rows, isAdmin, (targetUid) => {
+        if (confirm('Ban this player? They will be blocked from logging in again.')) {
+          banPlayer(targetUid).catch((err) => alert('Ban failed: ' + err.message));
+        }
+      });
+    }
+  }
+
   sunGroup.children.forEach(sprite => {
     sprite.lookAt(cameraGroup.position);
   });
@@ -927,17 +975,29 @@ function drawRemoteTracer(originArr, dirArr) {
   activeTracers.push({ mesh: line, life: 1, permanent: false });
 }
 
-function startNetwork(playerName) {
+function startNetwork(uid, playerName, room, adminFlag) {
+  myUid = uid;
+  myDisplayName = playerName;
+  isAdmin = adminFlag;
+  setAdminMode(isAdmin);
+
   network = createNetworkSystem({
     scene,
-    playerName: playerName || 'Player',
+    uid,
+    playerName,
+    room,
     eyeHeight: STAND_HEIGHT,
-    onLocalPlayerHit: (fromId, damage) => {
+    onLocalPlayerHit: (fromId, fromName, damage) => {
       if (isDead) return;
       playerHp = Math.max(0, playerHp - damage);
       lastDamageTime = performance.now() / 1000;
-      if (playerHp <= 0) die();
+      flashDamage(damage);
+      if (playerHp <= 0) die(fromName);
       updateHud();
+    },
+    onKillFeed: (killerName, victimName) => {
+      pushKillFeed(`${killerName} killed ${victimName}`);
+      if (killerName === myDisplayName) network.registerLocalKill();
     },
     onRemoteShot: (id, origin, dir) => {
       drawRemoteTracer(origin, dir);
@@ -946,18 +1006,94 @@ function startNetwork(playerName) {
 }
 
 const mpLogin = document.getElementById('mp-login');
-const mpConnectBtn = document.getElementById('mp-connect-btn');
+const authPanel = document.getElementById('mp-auth-panel');
+const roomPanel = document.getElementById('mp-room-panel');
+const tabLogin = document.getElementById('mp-tab-login');
+const tabSignup = document.getElementById('mp-tab-signup');
+const emailInput = document.getElementById('mp-email');
+const passwordInput = document.getElementById('mp-password');
+const authError = document.getElementById('mp-auth-error');
+const authSubmitBtn = document.getElementById('mp-auth-submit');
 const mpSoloBtn = document.getElementById('mp-solo-btn');
+const welcomeNameEl = document.getElementById('mp-welcome-name');
+const displayNameInput = document.getElementById('mp-display-name');
+const roomListEl = document.getElementById('mp-room-list');
 
-mpConnectBtn.addEventListener('click', () => {
-  const name = document.getElementById('mp-name').value.trim() || 'Player';
-  startNetwork(name);
-  mpLogin.style.display = 'none';
+let authMode = 'login';
+tabLogin.addEventListener('click', () => {
+  authMode = 'login';
+  tabLogin.classList.add('active'); tabSignup.classList.remove('active');
+  authSubmitBtn.textContent = 'LOG IN';
 });
+tabSignup.addEventListener('click', () => {
+  authMode = 'signup';
+  tabSignup.classList.add('active'); tabLogin.classList.remove('active');
+  authSubmitBtn.textContent = 'SIGN UP';
+});
+
+let pendingUid = null, pendingIsAdmin = false;
+
+authSubmitBtn.addEventListener('click', async () => {
+  authError.textContent = '';
+  authSubmitBtn.disabled = true;
+  authSubmitBtn.textContent = 'Please wait...';
+  try {
+    const { uid, isAdmin: adminFlag } = await loginOrSignUp(emailInput.value.trim(), passwordInput.value, authMode);
+    pendingUid = uid;
+    pendingIsAdmin = adminFlag;
+    welcomeNameEl.textContent = emailInput.value.trim();
+    authPanel.style.display = 'none';
+    roomPanel.style.display = 'flex';
+    await populateRoomList();
+  } catch (err) {
+    authError.textContent = err.message || 'Something went wrong.';
+  } finally {
+    authSubmitBtn.disabled = false;
+    authSubmitBtn.textContent = authMode === 'login' ? 'LOG IN' : 'SIGN UP';
+  }
+});
+
+async function populateRoomList() {
+  roomListEl.innerHTML = 'Loading server list...';
+  const counts = await fetchRoomCounts(ROOMS).catch(() => ({}));
+  roomListEl.innerHTML = '';
+  ROOMS.forEach((room) => {
+    const btn = document.createElement('button');
+    btn.className = 'room-btn';
+    const count = counts[room] ?? '?';
+    btn.innerHTML = `<span>${room}</span><span>${count} online</span>`;
+    btn.addEventListener('click', () => {
+      const name = displayNameInput.value.trim() || 'Player';
+      startNetwork(pendingUid, name, room, pendingIsAdmin);
+      mpLogin.style.display = 'none';
+    });
+    roomListEl.appendChild(btn);
+  });
+}
 
 mpSoloBtn.addEventListener('click', () => {
+  isAdmin = true; // solo/offline play - no one else around, debug tools are fine
+  setAdminMode(isAdmin);
   mpLogin.style.display = 'none';
 });
+
+// -----------------------------
+// LOADING SCREEN
+// -----------------------------
+const loadingScreen = document.getElementById('loading-screen');
+const loadingBar = document.getElementById('loading-bar');
+const TOTAL_ASSETS_TO_LOAD = WEAPON_CONFIGS.length + 1; // weapons + map
+let assetsLoaded = 0;
+
+function reportAssetLoaded() {
+  assetsLoaded++;
+  const pct = Math.min(100, Math.round((assetsLoaded / TOTAL_ASSETS_TO_LOAD) * 100));
+  loadingBar.style.width = pct + '%';
+  if (assetsLoaded >= TOTAL_ASSETS_TO_LOAD) {
+    loadingScreen.style.display = 'none';
+    mpLogin.style.display = 'flex';
+  }
+}
 
 // KICK OFF
 setHud(['Loading weapons and map...']);
