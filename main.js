@@ -13,7 +13,7 @@ import {
 } from './config.js';
 import { createUISystem } from './ui.js';
 import { TargetCube } from './targetCube.js'; // IMPORTED TARGET CUBE
-import { createNetworkSystem, loginOrSignUp, fetchRoomCounts, banPlayer, watchAuthState, logOut } from './network.js';
+import { createNetworkSystem, loginOrSignUp, banPlayer, watchAuthState, logOut } from './network.js';
 
 // ENGINE SETTINGS
 let playerHp = 150;
@@ -176,6 +176,7 @@ cameraGroup.position.copy(playerPos);
 const blocker = document.getElementById('blocker');
 blocker.addEventListener('click', () => {
   if (document.getElementById('game-menu').style.display !== 'none') return;
+  if (isDead) return;
   controls.lock();
 });
 controls.addEventListener('lock', () => blocker.style.display = 'none');
@@ -205,7 +206,7 @@ document.addEventListener('mousemove', (e) => {
 
 // MOUSE SCROLL WHEEL - WEAPON SWITCHING SYSTEM
 document.addEventListener('wheel', (e) => {
-  if (!controls.isLocked) return;
+  if (!controls.isLocked || isDead) return;
   
   const step = e.deltaY > 0 ? 1 : -1;
   const currentSlot = Math.max(0, loadoutOrder.indexOf(currentIndex));
@@ -679,7 +680,7 @@ function raycastHit(offsetX = 0, offsetY = 0) {
 }
 
 document.addEventListener('mousedown', (e) => {
-  if (!controls.isLocked) return;
+  if (!controls.isLocked || isDead) return;
   if (e.button === 0) { leftMouseDown = true; tryShoot(); }
   if (e.button === 2) setScope(true); 
 });
@@ -692,7 +693,7 @@ document.addEventListener('contextmenu', (e) => e.preventDefault());
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Tab') { e.preventDefault(); toggleMenu(); return; }
 
-  if (!controls.isLocked) return;
+  if (!controls.isLocked || isDead) return;
   switch (e.code) {
     case 'KeyR': tryReload(); break;
     case 'KeyH': tryInspect(); break;
@@ -741,7 +742,7 @@ window.addEventListener('resize', () => {
 const damageVignette = document.getElementById('damage-vignette');
 function flashDamage(amount) {
   const intensity = Math.min(1, amount / 40); // scales with hit size, caps out
-  damageVignette.style.boxShadow = `inset 0 0 ${80 + intensity * 60}px ${20 + intensity * 20}px rgba(255,0,0,${0.35 + intensity * 0.35})`;
+  damageVignette.style.boxShadow = `inset 0 0 ${80 + intensity * 60}px ${20 + intensity * 20}px rgba(255,0,0,${0.5 + intensity * 0.4})`;
   clearTimeout(flashDamage._t);
   flashDamage._t = setTimeout(() => { damageVignette.style.boxShadow = 'inset 0 0 0 0 rgba(255,0,0,0)'; }, 220);
 }
@@ -833,23 +834,32 @@ function buildWeaponSelects() {
     .map((cfg, i) => ({ cfg, i }))
     .filter(({ cfg }) => cfg.slot === 'primary');
 
+  const prevSecondaryVal = secondarySelect.value;
   secondarySelect.innerHTML = secondaries.map(({ cfg, i }) => `<option value="${i}">${cfg.name}</option>`).join('');
+  if ([...secondarySelect.options].some(o => o.value === prevSecondaryVal)) secondarySelect.value = prevSecondaryVal;
 
-  function fillPrimarySelect(sel, excludeIndex) {
+  function fillPrimarySelect(sel, excludeIndices) {
     const prevVal = sel.value;
     sel.innerHTML = primaries
-      .filter(({ i }) => i !== excludeIndex)
+      .filter(({ i }) => !excludeIndices.includes(i))
       .map(({ cfg, i }) => `<option value="${i}">${cfg.name}</option>`).join('');
     if ([...sel.options].some(o => o.value === prevVal)) sel.value = prevVal;
   }
 
-  fillPrimarySelect(primary1Select, parseInt(primary2Select.value, 10));
-  fillPrimarySelect(primary2Select, parseInt(primary1Select.value, 10));
+  const secIdx = parseInt(secondarySelect.value, 10);
+  // Each primary dropdown excludes: the other primary's pick, AND whatever's
+  // currently chosen as secondary - otherwise (e.g. Shotty's Double Barrel
+  // secondary option) the same weapon could end up double-booked into two
+  // slots at once, silently costing you one of your three intended weapons.
+  fillPrimarySelect(primary1Select, [parseInt(primary2Select.value, 10), secIdx]);
+  fillPrimarySelect(primary2Select, [parseInt(primary1Select.value, 10), secIdx]);
 
   armorChoiceRow.style.display = (special.id === 'heavy') ? 'block' : 'none';
   if (special.id !== 'heavy') armorCheckbox.checked = false;
   updateArmorCheckboxLabel();
 }
+
+secondarySelect.addEventListener('change', () => buildWeaponSelects());
 
 function updateArmorCheckboxLabel() {
   const cfg = WEAPON_CONFIGS[parseInt(primary2Select.value, 10)];
@@ -1057,7 +1067,7 @@ function animate() {
     network.tick(delta);
   }
 
-  if (controls.isLocked) {
+  if (controls.isLocked && !isDead) {
     movePlayer(delta);
   } else {
     moveState.moving = false; moveState.sprinting = false;
@@ -1143,7 +1153,7 @@ function animate() {
     w.pivot.quaternion.slerp(scoped ? w.scopedRot : w.baseRot, 1 - Math.pow(0.001, delta));
   }
 
-  if (controls.isLocked && leftMouseDown && w.loaded && w.cfg.fireMode === 'auto') {
+  if (controls.isLocked && !isDead && leftMouseDown && w.loaded && w.cfg.fireMode === 'auto') {
     w.fireTimer += delta;
     const interval = 1 / ((w.cfg.fireRate || 8) * getFireRateMultiplier(w.cfg));
     while (w.fireTimer >= interval) { w.fireTimer -= interval; tryShoot(); }
@@ -1346,14 +1356,11 @@ authSubmitBtn.addEventListener('click', async () => {
 
 async function populateRoomList() {
   displayNameInput.value = localStorage.getItem('potatoshooter_display_name') || '';
-  roomListEl.innerHTML = 'Loading server list...';
-  const counts = await fetchRoomCounts(ROOMS).catch(() => ({}));
   roomListEl.innerHTML = '';
   ROOMS.forEach((room) => {
     const btn = document.createElement('button');
     btn.className = 'room-btn';
-    const count = counts[room] ?? '?';
-    btn.innerHTML = `<span>${room}</span><span>${count} online</span>`;
+    btn.innerHTML = `<span>${room}</span>`;
     btn.addEventListener('click', () => {
       const name = displayNameInput.value.trim() || 'Player';
       localStorage.setItem('potatoshooter_display_name', name);
