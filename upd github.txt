@@ -1,4 +1,4 @@
 cd /home/realhumanname/Documents/mosin-fps-demo
 git add .
-git commit -m "Changes"
+git commit -m "Bug fixes & Changes"
 git push
