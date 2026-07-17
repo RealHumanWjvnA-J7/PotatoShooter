@@ -280,6 +280,7 @@ function loadWeaponAssets(index) {
   const w = weapons[index];
   const cfg = w.cfg;
 
+  reportAssetLoading(cfg.name);
   loader.load(
     cfg.file,
     (gltf) => {
@@ -348,14 +349,15 @@ function loadWeaponAssets(index) {
       
       w.loaded = true;
       updateHud();
-      reportAssetLoaded();
+      reportAssetLoaded(cfg.name);
     },
     undefined,
-    (err) => { console.error(`Failed to load weapon:`, err); updateHud(); reportAssetLoaded(); }
+    (err) => { console.error(`Failed to load weapon:`, err); updateHud(); reportAssetLoaded(cfg.name); }
   );
 }
 
 function loadMap(path) {
+  reportAssetLoading('Map');
   loader.load(
     path,
     (gltf) => {
@@ -376,12 +378,12 @@ function loadMap(path) {
       collidables.push(myTarget.mesh);
       
       applyGraphicsSettings();
-      reportAssetLoaded();
+      reportAssetLoaded('Map');
     },
     undefined,
     (err) => { 
       collidables = [fallbackGround, myTarget.mesh]; 
-      reportAssetLoaded();
+      reportAssetLoaded('Map');
     }
   );
 }
@@ -1417,14 +1419,21 @@ function tryApplyRestoredSession() {
 // -----------------------------
 const loadingScreen = document.getElementById('loading-screen');
 const loadingBar = document.getElementById('loading-bar');
+const loadingItemEl = document.getElementById('loading-item');
 const TOTAL_ASSETS_TO_LOAD = WEAPON_CONFIGS.length + 1; // weapons + map
 let assetsLoaded = 0;
 
-function reportAssetLoaded() {
+function reportAssetLoading(name) {
+  if (loadingItemEl) loadingItemEl.textContent = `Loading ${name}...`;
+}
+
+function reportAssetLoaded(name) {
   assetsLoaded++;
   const pct = Math.min(100, Math.round((assetsLoaded / TOTAL_ASSETS_TO_LOAD) * 100));
   loadingBar.style.width = pct + '%';
+  if (loadingItemEl && name) loadingItemEl.textContent = `Loaded ${name} (${assetsLoaded}/${TOTAL_ASSETS_TO_LOAD})`;
   if (assetsLoaded >= TOTAL_ASSETS_TO_LOAD) {
+    if (loadingItemEl) loadingItemEl.textContent = 'Done.';
     loadingScreen.style.display = 'none';
     mpLogin.style.display = 'flex';
     tryApplyRestoredSession();
