@@ -6,6 +6,9 @@ import {
   ANIM_NAMES, NORMAL_FOV, FAKE_SCOPE_FOV, MAX_BULLET_HOLES, WEAPON_CONFIGS,
   MAX_HP, GRAPHICS_PROFILES, ANTI_ALIASING_TIERS,
   HP_REGEN_DELAY, HP_REGEN_RATE, RESPAWN_DELAY, SPAWN_POINTS,
+  FALL_DAMAGE_SAFE_DISTANCE, FALL_DAMAGE_PER_UNIT_INTERVAL, FALL_DAMAGE_PER_INTERVAL,
+  HEAVY_FALL_DAMAGE_MULT, HEAVY_FALL_DAMAGE_ARMOR_MULT,
+  FALLOFF_UNIT_INTERVAL, FALLOFF_PER_INTERVAL,
   MOVE_SPEED, SPRINT_MULTIPLIER, CROUCH_SPEED_MULTIPLIER, JUMP_SPEED, GRAVITY,
   STAND_HEIGHT, CROUCH_HEIGHT, PLAYER_RADIUS, LEAN_ANGLE, LEAN_OFFSET,
   BOB_SMOOTHING, BOB_PROFILES, ROOMS,
@@ -224,6 +227,7 @@ document.addEventListener('wheel', (e) => {
 
 let verticalVelocity = 0;
 let grounded = false;
+let fallApexY = null; // highest Y reached since last grounded - null while grounded
 
 let recoilX = 0;
 let recoilY = 0;
@@ -593,6 +597,12 @@ function applyPistolReloadTimeScale(w) {
   return 1;
 }
 
+function getFalloffAdjustedDamage(baseDamage, cfg, distance) {
+  if (cfg.exemptFromFalloff) return baseDamage;
+  const intervals = Math.floor(distance / FALLOFF_UNIT_INTERVAL);
+  return Math.max(0, baseDamage - intervals * FALLOFF_PER_INTERVAL);
+}
+
 function raycastHit(offsetX = 0, offsetY = 0) {
   const raycaster = new THREE.Raycaster();
   _scratchVec2D.set(offsetX, offsetY);
@@ -615,7 +625,7 @@ function raycastHit(offsetX = 0, offsetY = 0) {
 
         if (hitId) {
           const w = W();
-          let dmg = (w.cfg.damage || 25) * getWeaponDamageMultiplier(w.cfg);
+          let dmg = getFalloffAdjustedDamage(w.cfg.damage || 25, w.cfg, playerHits[0].distance) * getWeaponDamageMultiplier(w.cfg);
 
           if (currentSpecial && currentSpecial.id === 'sniper' && w.cfg.name === 'Sniper') {
             dmg += Math.floor(playerHits[0].distance / 25) * currentSpecial.rangeDamageBonusPer25;
@@ -652,7 +662,8 @@ function raycastHit(offsetX = 0, offsetY = 0) {
     
     // RAYCAST DAMAGE PROCESSING BLOCK
     if (hit.object.userData.isTargetCube) {
-      const dmg = W().cfg.damage || 25; 
+      const w = W();
+      const dmg = getFalloffAdjustedDamage(w.cfg.damage || 25, w.cfg, hit.distance);
       hit.object.userData.parentInstance.takeDamage(dmg);
     }
     
@@ -762,6 +773,42 @@ function pushKillFeed(text) {
 // -----------------------------
 // HP / DEATH / RESPAWN
 // -----------------------------
+// Fall damage: no damage under FALL_DAMAGE_SAFE_DISTANCE units fallen (from
+// the airborne apex, not takeoff point - so jumping up then falling back to
+// the same spot doesn't count the jump's own height against you). Past that,
+// -5 HP per 2 units. Heavy takes it worse (worse if the armor swap landed).
+// NOTE: intentionally doesn't interact with Lucky's "survive a lethal hit"
+// perk - that's flavored around surviving gunfire, not falls.
+function applyFallDamage(fallDistance) {
+  if (isDead || fallDistance <= FALL_DAMAGE_SAFE_DISTANCE) return;
+
+  const overage = fallDistance - FALL_DAMAGE_SAFE_DISTANCE;
+  const intervals = Math.floor(overage / FALL_DAMAGE_PER_UNIT_INTERVAL);
+  let dmg = intervals * FALL_DAMAGE_PER_INTERVAL;
+  if (dmg <= 0) return;
+
+  if (currentSpecial && currentSpecial.id === 'heavy') {
+    dmg *= HEAVY_FALL_DAMAGE_MULT;
+    if (armorHp > 0) dmg *= HEAVY_FALL_DAMAGE_ARMOR_MULT;
+  }
+
+  if (currentSpecial && currentSpecial.damageTakenMult) {
+    dmg *= currentSpecial.damageTakenMult;
+  }
+
+  if (armorHp > 0) {
+    const absorbed = Math.min(armorHp, dmg);
+    armorHp -= absorbed;
+    dmg -= absorbed;
+  }
+
+  playerHp = Math.max(0, playerHp - dmg);
+  lastDamageTime = performance.now() / 1000;
+  flashDamage(dmg);
+  if (playerHp <= 0) die(null); // environmental death - no killer credited
+  updateHud();
+}
+
 function die(killerName = null) {
   if (isDead) return;
   isDead = true;
@@ -780,6 +827,7 @@ function actuallyRespawn() {
   cameraGroup.position.copy(playerPos);
   verticalVelocity = 0;
   grounded = true;
+  fallApexY = null;
   playerHp = effectiveMaxHp;
   isDead = false;
   awaitingLoadoutPick = false;
@@ -1010,6 +1058,8 @@ function movePlayer(delta) {
   const groundY = (groundHit === null ? -9999 : groundHit) + currentHeight;
 
   if (playerPos.y > groundY + 0.05) {
+    if (grounded) fallApexY = playerPos.y; // just left the ground - start tracking
+    else if (fallApexY !== null && playerPos.y > fallApexY) fallApexY = playerPos.y; // still rising (e.g. jump)
     grounded = false;
     verticalVelocity -= GRAVITY * delta;
     playerPos.y += verticalVelocity * delta;
@@ -1018,10 +1068,16 @@ function movePlayer(delta) {
       _rayUp.far = 0.3; 
       if (_rayUp.intersectObjects(collidables, true).length > 0) verticalVelocity = 0; 
     }
-    if (playerPos.y < groundY) { playerPos.y = groundY; verticalVelocity = 0; grounded = true; }
+    if (playerPos.y < groundY) {
+      playerPos.y = groundY; verticalVelocity = 0; grounded = true;
+      if (fallApexY !== null) { applyFallDamage(fallApexY - groundY); fallApexY = null; }
+    }
   } else if (verticalVelocity <= 0) {
+    if (!grounded && fallApexY !== null) { applyFallDamage(fallApexY - groundY); fallApexY = null; }
     playerPos.y = groundY; verticalVelocity = 0; grounded = true;
   } else {
+    if (grounded) fallApexY = playerPos.y;
+    else if (fallApexY !== null && playerPos.y > fallApexY) fallApexY = playerPos.y;
     playerPos.y += verticalVelocity * delta;
     verticalVelocity -= GRAVITY * delta;
     grounded = false;
@@ -1303,6 +1359,14 @@ function startNetwork(uid, playerName, room, adminFlag) {
     },
     onRemoteShot: (id, origin, dir) => {
       drawRemoteTracer(origin, dir);
+    },
+    onConnectionChange: (isUp, hasEverConnected) => {
+      const banner = document.getElementById('connection-banner');
+      if (!banner) return;
+      // Only show the banner once we've actually been connected at least
+      // once - otherwise it'd flash on for a moment during the very first
+      // connect, which isn't a "lost connection" event.
+      banner.style.display = (!isUp && hasEverConnected) ? 'block' : 'none';
     },
   });
 }

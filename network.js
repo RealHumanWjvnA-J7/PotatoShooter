@@ -112,13 +112,25 @@ export function banPlayer(uid) {
  * @param {number} [deps.eyeHeight=1.8]
  */
 export function createNetworkSystem(deps) {
-  const { scene, uid, playerName, room, onLocalPlayerHit, onKillFeed, onRemoteShot, eyeHeight = 1.8, getLocalState } = deps;
+  const { scene, uid, playerName, room, onLocalPlayerHit, onKillFeed, onRemoteShot, eyeHeight = 1.8, getLocalState, onConnectionChange } = deps;
 
   const myPlayerRef = ref(db, `players/${room}/${uid}`);
   const eventsRef = ref(db, `events/${room}`);
 
   let connected = false;
+  let hasEverConnected = false;
   const seenEventKeys = new Set();
+
+  // Firebase's special connection-state path - fires whenever the client's
+  // socket to the RTDB backend actually goes up/down, independent of our
+  // own `connected` flag above (which just means "we've called connect()").
+  // This is what lets us show a real "reconnecting..." UI instead of the
+  // game silently freezing/desyncing when wifi hiccups.
+  onValue(ref(db, '.info/connected'), (snap) => {
+    const isUp = snap.val() === true;
+    if (isUp) hasEverConnected = true;
+    if (onConnectionChange) onConnectionChange(isUp, hasEverConnected);
+  });
 
   /** @type {Map<string, { root, nameSprite, body, targetPos, targetRotY, targetCrouch, targetLean, hp, name, kills, deaths, lastUpdate }>} */
   const remotePlayers = new Map();

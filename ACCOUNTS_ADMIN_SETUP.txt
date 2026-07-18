@@ -22,14 +22,21 @@ Realtime Database -> Rules tab -> replace everything with:
       "$room": {
         "$uid": {
           ".read": true,
-          ".write": "auth != null && auth.uid == $uid"
+          ".write": "auth != null && auth.uid == $uid",
+          "hp": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 250" },
+          "kills": { ".validate": "newData.isNumber() && newData.val() >= 0" },
+          "deaths": { ".validate": "newData.isNumber() && newData.val() >= 0" },
+          "name": { ".validate": "newData.isString() && newData.val().length <= 24" }
         }
       }
     },
     "events": {
       "$room": {
         ".read": true,
-        ".write": "auth != null"
+        ".write": "auth != null",
+        "$eventId": {
+          "damage": { ".validate": "!newData.exists() || (newData.isNumber() && newData.val() >= 0 && newData.val() <= 300)" }
+        }
       }
     },
     "banned": {
@@ -55,6 +62,20 @@ you can only add admins by editing the database directly in the
 Firebase console (Part 4 below), never from the app itself. That's
 intentional - it means there's no code path, bug, or exploit that lets
 someone grant themselves admin.
+
+The ".validate" entries added above put hard ceilings on the values a
+client can write (hp can't exceed 250, a single damage event can't claim
+more than 300, names are capped at 24 chars, etc). This does NOT make
+hit detection server-authoritative - a modified client can still report
+a hit that never really happened, since Firebase has no idea what a
+"raycast" is. What it DOES stop is the class of bug/cheat where a client
+writes an absurd or malformed value (negative HP, a 999999 damage event,
+a kill count that never increments through real play) that would corrupt
+other players' UI or break assumptions elsewhere in the code. Real
+hit-detection integrity would require moving that logic server-side
+(Cloud Functions on a paid Firebase plan, or a custom relay server like
+the one described in README.txt) - that's a bigger project than a rules
+change and isn't done here.
 
 -----------------------------------------------------------------
 PART 3 - CREATE YOUR OWN ACCOUNT

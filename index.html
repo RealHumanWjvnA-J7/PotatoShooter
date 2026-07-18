@@ -84,6 +84,12 @@
   }
   #kill-feed div { margin-bottom: 4px; opacity: 1; transition: opacity 2s; }
 
+  #connection-banner {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 50;
+    background: #a00; color: #fff; font-family: monospace; font-size: 13px;
+    text-align: center; padding: 6px; display: none;
+  }
+
   #loadout-screen {
     position: fixed; inset: 0; z-index: 35; background: rgba(0,0,0,0.92);
     color: #0f0; display: none; align-items: center; justify-content: center;
@@ -126,6 +132,7 @@
 <div id="blocker"></div>
 <div id="damage-vignette"></div>
 <div id="kill-feed"></div>
+<div id="connection-banner">Connection lost - reconnecting...</div>
 <div id="start-line-banner"></div>
 <div id="armor-flip-result"></div>
 

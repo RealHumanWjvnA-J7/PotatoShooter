@@ -1,6 +1,20 @@
 export const MAP_FILE = 'assets/map.gltf';
 export const MAP_SCALE = 0.110;
 
+// -----------------------------
+// MAP REGISTRY
+// -----------------------------
+// Multiple selectable maps. `id` is what gets stored/voted on over the
+// network (Firebase, vote records) - keep it stable even if `name`
+// changes later. `file`/`scale` feed straight into loadMap().
+// ASSUMPTION: House uses the same scale as Construction for now (0.110) -
+// adjust MAP_SCALE below once it's been walked in-engine, per earlier
+// scale-check note.
+export const MAPS = [
+  { id: 'construction', name: 'Construction', file: 'assets/map.gltf', scale: 0.110 },
+  { id: 'house', name: 'House', file: 'assets/skyscraper.gltf', scale: 0.110 },
+];
+
 export const DEFAULT_TARGET_LENGTH = 0.9;
 export const DEFAULT_SCALE_MULTIPLIER = 3.0;
 
@@ -108,6 +122,7 @@ export const WEAPON_CONFIGS = [
     magSize: 5,
     fireMode: 'semi',
     damage: 60,
+    exemptFromFalloff: true,
     position: [0.1, -0.4, -1.0],
     rotation: [0, Math.PI, 0],
     scopedPosition: [-0.0475, -0.2335, -0.6],
@@ -115,6 +130,24 @@ export const WEAPON_CONFIGS = [
     scopedFov: 25,
     scopedSensitivity: 0.30,
     recoilY: 0.15,
+    recoilX: 0.05
+  },
+  {
+    name: '.357',
+    file: 'assets/357.gltf',
+    slot: 'secondary',
+    magSize: 6,
+    fireMode: 'semi',
+    damage: 15,
+    exemptFromFalloff: true,
+    reloadSpeedMult: 0.65, // slower/heavier than the default reload feel - deliberate, revolver should feel dramatic not snappy
+    position: [-0.02, -1.5, -1.5],
+    rotation: [0, Math.PI, 0],
+    scopedPosition: [-0.11, -1.12, -0.7],
+    scopedRotation: [0, Math.PI, 0],
+    scopedFov: 58,
+    scopedSensitivity: 0.7,
+    recoilY: 0.09,
     recoilX: 0.05
   }
 ];
@@ -200,6 +233,28 @@ export const MAX_HP = 150;
 export const HP_REGEN_DELAY = 5;    // seconds since last damage before regen starts
 export const HP_REGEN_RATE = 12;    // hp per second while regenerating
 export const RESPAWN_DELAY = 3;     // seconds spent dead before respawning
+
+// -----------------------------
+// FALL DAMAGE
+// -----------------------------
+// No damage under this many units fallen. Past that, -5 HP per 2 units.
+// Heavy takes +5% more fall damage, +2.5% more on top of that if their
+// armor-swap coin flip landed on armor (checked in main.js via
+// currentSpecial.id === 'heavy' && usingArmor).
+export const FALL_DAMAGE_SAFE_DISTANCE = 8;
+export const FALL_DAMAGE_PER_UNIT_INTERVAL = 2;
+export const FALL_DAMAGE_PER_INTERVAL = 5;
+export const HEAVY_FALL_DAMAGE_MULT = 1.05;
+export const HEAVY_FALL_DAMAGE_ARMOR_MULT = 1.025; // stacks multiplicatively with the above
+
+// -----------------------------
+// DAMAGE FALLOFF BY RANGE
+// -----------------------------
+// -1 damage per 20 units traveled, for every weapon except ones flagged
+// `exemptFromFalloff: true` in WEAPON_CONFIGS (Sniper, .357).
+export const FALLOFF_UNIT_INTERVAL = 20;
+export const FALLOFF_PER_INTERVAL = 1;
+
 export const SPAWN_POINTS = [
   [50, 2.5, 0],
   [45, 2.5, 6],
