@@ -946,7 +946,14 @@ loadoutConfirmBtn.addEventListener('click', () => {
   [secIdx, p1Idx, p2Idx].forEach((i) => {
     if (weapons[i]) weapons[i].ammo = WEAPON_CONFIGS[i].magSize;
   });
+  // Hide whatever pivot was visible before (usually the Pistol, loaded
+  // first at index 0) and show the actually-selected secondary's pivot -
+  // just reassigning currentIndex here (without this) left the old
+  // weapon's model visible forever, since only switchWeapon() used to
+  // toggle .visible, and this confirm handler bypassed it.
+  weapons.forEach((w) => { if (w.pivot) w.pivot.visible = false; });
   currentIndex = secIdx; // hands them their secondary by default; they can switch immediately
+  if (weapons[currentIndex].pivot) weapons[currentIndex].pivot.visible = true;
 
   loadoutScreen.style.display = 'none';
   showStartLine(special.startLine);
@@ -956,7 +963,11 @@ loadoutConfirmBtn.addEventListener('click', () => {
     allowedWeaponIndices.delete(p2Idx);
     loadoutOrder = loadoutOrder.filter((i) => i !== p2Idx);
     armorHp = HEAVY_ARMOR_HP;
-    if (currentIndex === p2Idx) currentIndex = secIdx;
+    if (currentIndex === p2Idx) {
+      if (weapons[currentIndex].pivot) weapons[currentIndex].pivot.visible = false;
+      currentIndex = secIdx;
+      if (weapons[currentIndex].pivot) weapons[currentIndex].pivot.visible = true;
+    }
     armorFlipEl.textContent = `Running Armor instead of ${WEAPON_CONFIGS[p2Idx].name}: +${HEAVY_ARMOR_HP} armor (non-regenerating).`;
   } else {
     armorFlipEl.textContent = '';
