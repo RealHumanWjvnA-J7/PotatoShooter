@@ -185,6 +185,10 @@ export function createUISystem(deps) {
           <button id="btn-visible-player">OFF</button>
         </div>
         <div style="margin-bottom:10px;">
+          <label>Show XYZ Position:</label>
+          <button id="btn-show-coords">OFF</button>
+        </div>
+        <div style="margin-bottom:10px;">
           <label>Graphics Quality:</label>
           <button id="btn-graphics">MEDIUM</button>
         </div>
@@ -238,6 +242,14 @@ export function createUISystem(deps) {
     btnVisiblePlayer.addEventListener('click', () => {
       settings.visiblePlayer = !settings.visiblePlayer;
       btnVisiblePlayer.textContent = settings.visiblePlayer ? 'ON' : 'OFF';
+    });
+
+    const btnShowCoords = document.getElementById('btn-show-coords');
+    btnShowCoords.addEventListener('click', () => {
+      settings.showCoords = !settings.showCoords;
+      btnShowCoords.textContent = settings.showCoords ? 'ON' : 'OFF';
+      const coordsEl = document.getElementById('coords-display');
+      if (coordsEl) coordsEl.style.display = settings.showCoords ? 'block' : 'none';
     });
 
     const graphicsLevels = Object.keys(GRAPHICS_PROFILES);

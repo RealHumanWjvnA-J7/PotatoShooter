@@ -6,7 +6,7 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js';
 import {
   getDatabase, ref, set, update, remove, onValue, onDisconnect,
-  push, onChildAdded, serverTimestamp, get,
+  push, onChildAdded, serverTimestamp, get, runTransaction,
 } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-database.js';
 
 // -----------------------------
@@ -29,10 +29,23 @@ const FIREBASE_CONFIG = {
 const STATE_SEND_HZ = 15;
 const INTERP_SPEED = 12;
 const STALE_PLAYER_MS = 10000;
+// Every this many ms since the last reset, one connected client (whichever's
+// periodic check happens to run first) triggers a "kick everyone" reset via
+// a Firebase transaction, so only one of them actually wins even if several
+// clients' checks fire close together. ASSUMPTION: measured as an interval
+// since the last reset, not fixed wall-clock times (e.g. always 8am/4pm/
+// midnight) - "every 8 hours" read as a rolling interval. Also note: this
+// is a client-driven mechanism (no Cloud Functions/paid Firebase plan is in
+// use), so it only fires while at least one client is connected to check -
+// a server sitting fully empty for a long stretch won't reset itself until
+// someone reconnects, at which point the overdue check fires immediately.
+const SERVER_RESET_INTERVAL_MS = 8 * 60 * 60 * 1000;
+const SERVER_RESET_CHECK_INTERVAL_MS = 60 * 1000;
 
 const app = initializeApp(FIREBASE_CONFIG);
 const auth = getAuth(app);
 const db = getDatabase(app);
+export { db };
 
 /**
  * Creates or logs into an account. Returns { uid, isAdmin } on success,
@@ -112,7 +125,7 @@ export function banPlayer(uid) {
  * @param {number} [deps.eyeHeight=1.8]
  */
 export function createNetworkSystem(deps) {
-  const { scene, uid, playerName, room, onLocalPlayerHit, onKillFeed, onRemoteShot, eyeHeight = 1.8, getLocalState, onConnectionChange } = deps;
+  const { scene, uid, playerName, room, onLocalPlayerHit, onKillFeed, onRemoteShot, eyeHeight = 1.8, getLocalState, onConnectionChange, onForceKick } = deps;
 
   const myPlayerRef = ref(db, `players/${room}/${uid}`);
   const eventsRef = ref(db, `events/${room}`);
@@ -131,6 +144,45 @@ export function createNetworkSystem(deps) {
     if (isUp) hasEverConnected = true;
     if (onConnectionChange) onConnectionChange(isUp, hasEverConnected);
   });
+
+  // -----------------------------
+  // SCHEDULED SERVER RESET - every SERVER_RESET_INTERVAL_MS, kick everyone.
+  // Purely client-driven (no server/Cloud Function): every connected client
+  // watches `serverMeta/lastReset`, and separately runs a periodic check
+  // that tries to bump it via a Firebase transaction once it's overdue.
+  // Transactions are atomic, so if multiple clients' checks fire close
+  // together only one of them actually succeeds in writing the new value -
+  // everyone (including the "winner") then sees serverMeta/lastReset change
+  // and gets kicked via onForceKick, same as any other client.
+  // -----------------------------
+  const lastResetRef = ref(db, 'serverMeta/lastReset');
+  let sawInitialResetValue = false;
+  let localLastResetSeen = null;
+
+  onValue(lastResetRef, (snap) => {
+    const val = snap.val();
+    if (!sawInitialResetValue) {
+      // First read on connect - just record it, don't kick ourselves for
+      // a reset that happened before we even joined.
+      sawInitialResetValue = true;
+      localLastResetSeen = val || 0;
+      return;
+    }
+    if (val && val !== localLastResetSeen) {
+      localLastResetSeen = val;
+      if (onForceKick) onForceKick();
+    }
+  });
+
+  setInterval(() => {
+    runTransaction(lastResetRef, (current) => {
+      const now = Date.now();
+      if (!current || now - current >= SERVER_RESET_INTERVAL_MS) {
+        return now; // we're overdue (or this is the very first check ever) - claim the reset
+      }
+      return; // undefined = abort, not overdue yet, leave it alone
+    }).catch(() => {}); // permission hiccups etc. - next check 60s later will just try again
+  }, SERVER_RESET_CHECK_INTERVAL_MS);
 
   /** @type {Map<string, { root, nameSprite, body, targetPos, targetRotY, targetCrouch, targetLean, hp, name, kills, deaths, lastUpdate }>} */
   const remotePlayers = new Map();
@@ -215,6 +267,7 @@ export function createNetworkSystem(deps) {
         hp: data.hp, name: data.name,
         kills: data.kills || 0, deaths: data.deaths || 0,
         lastUpdate: Date.now(),
+        lastTp: data.tp || 0,
       });
       console.log(`[net] spawned remote player "${data.name}" (${id})`);
     } else {
@@ -228,6 +281,19 @@ export function createNetworkSystem(deps) {
       rp.kills = data.kills || 0;
       rp.deaths = data.deaths || 0;
       rp.lastUpdate = Date.now();
+
+      // Respawn (or any other intentional teleport) changes tp - snap
+      // instantly instead of letting tick()'s lerp glide the model across
+      // the map (potentially straight through walls) from the death spot
+      // to the new spawn point over the next several frames.
+      const incomingTp = data.tp || 0;
+      if (incomingTp !== rp.lastTp) {
+        rp.lastTp = incomingTp;
+        rp.root.position.copy(rp.targetPos);
+        rp.root.rotation.y = rp.targetRotY;
+        rp.root.rotation.z = rp.targetLean;
+        rp.root.scale.setScalar(rp.targetScale);
+      }
 
       // Name can arrive late (race between the player-list snapshot and
       // their own name write finishing) - if it changes after creation,
@@ -319,6 +385,7 @@ export function createNetworkSystem(deps) {
       scale: state.scale || 1,
       weaponIndex: state.weaponIndex,
       hp: state.hp,
+      tp: state.tp || 0,
       kills: myKills,
       deaths: myDeaths,
       updatedAt: serverTimestamp(),

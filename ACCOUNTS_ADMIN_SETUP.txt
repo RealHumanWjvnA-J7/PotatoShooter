@@ -26,8 +26,15 @@ Realtime Database -> Rules tab -> replace everything with:
           "hp": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 250" },
           "kills": { ".validate": "newData.isNumber() && newData.val() >= 0" },
           "deaths": { ".validate": "newData.isNumber() && newData.val() >= 0" },
+          "roundKills": { ".validate": "newData.isNumber() && newData.val() >= 0" },
           "name": { ".validate": "newData.isString() && newData.val().length <= 24" }
         }
+      }
+    },
+    "matchState": {
+      "$room": {
+        ".read": true,
+        ".write": "auth != null"
       }
     },
     "events": {
@@ -46,6 +53,13 @@ Realtime Database -> Rules tab -> replace everything with:
     "admins": {
       ".read": true,
       ".write": false
+    },
+    "serverMeta": {
+      ".read": true,
+      "lastReset": {
+        ".write": "auth != null",
+        ".validate": "newData.isNumber()"
+      }
     }
   }
 }
@@ -121,6 +135,30 @@ You can also ban manually: Realtime Database -> Data -> add a child
 under "banned" with their UID as the key and `true` as the value.
 
 -----------------------------------------------------------------
+MATCH STATE / VOTING (Phase 2)
+-----------------------------------------------------------------
+The "matchState" node above (one per room) backs the round lifecycle:
+playing -> post-match summary -> mode vote -> map vote -> playing again.
+Like the scheduled reset, this is entirely client-driven - every
+connected client periodically checks whether the current phase is
+overdue to end and tries to advance it via a Firebase transaction, so
+only one client's attempt actually takes effect even if several fire at
+once. There's no per-uid restriction on this node ("auth != null" only,
+not "auth.uid == $uid") - that's intentional, not an oversight: advancing
+the phase or tallying votes means writing data that isn't "owned" by any
+one player (the room's shared phase/mode/map/vote-tally state), and
+Firebase's rule cascading means a broad grant at this node level is what
+makes that possible. The realistic griefing risk (someone spamming
+duplicate votes under their own uid, or nudging phase transitions
+slightly early) is low-stakes for a friend-group game and not worth the
+complexity of trying to lock it down further.
+
+Round win conditions right now are a placeholder: first to a mode's kill
+count, or whoever's ahead when the time limit runs out. Each mode's real
+scoring (team score, weapon-tier progress, capture time, infection state)
+plugs into this same phase machine later without changing it.
+
+-----------------------------------------------------------------
 ROOMS / SERVERS
 -----------------------------------------------------------------
 5 rooms ("Server 1" through "Server 5") are hardcoded in config.js
@@ -128,3 +166,33 @@ ROOMS / SERVERS
 and kill feeds don't cross between rooms. The room-select screen shows
 live player counts per room before you pick. To change the number/names
 of rooms, edit the ROOMS array in config.js.
+
+-----------------------------------------------------------------
+SCHEDULED SERVER RESET (every 8 hours)
+-----------------------------------------------------------------
+Every 8 hours since the last reset, everyone across every room gets
+kicked (shown a message, then their page reloads for a clean
+reconnect). This needs the "serverMeta" node added to the database
+rules above - make sure you've republished the updated rules block or
+this silently never fires (fails permission checks forever, caught and
+ignored rather than erroring loudly).
+
+This is entirely client-driven - there's no Cloud Function or cron job
+running anywhere, since scheduled Cloud Functions need a paid Firebase
+plan. Instead, every connected client periodically checks whether a
+reset is overdue and, if so, tries to claim it via a Firebase
+transaction. Transactions are atomic, so if several clients' checks
+fire close together only one of them actually succeeds in writing the
+new reset timestamp - everyone (including that client) then sees the
+change and gets kicked together, avoiding a pile-up of simultaneous
+resets.
+
+Two honest limitations worth knowing:
+- It's a rolling 8-hour interval since the last reset, not fixed clock
+  times (e.g. not guaranteed to always land at 8am/4pm/midnight).
+- It only fires while at least one client is connected to run the
+  check. If every room sits completely empty for a long stretch, nobody
+  gets kicked on schedule - the overdue reset just fires as soon as
+  someone reconnects and notices it's overdue, which is harmless (no
+  one was there to kick anyway) but means the timing isn't perfectly
+  precise if the servers go quiet for a while.

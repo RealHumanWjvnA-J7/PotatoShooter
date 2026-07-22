@@ -84,6 +84,23 @@
   }
   #kill-feed div { margin-bottom: 4px; opacity: 1; transition: opacity 2s; }
 
+  #coords-display {
+    position: fixed; top: 8px; right: 8px; z-index: 11; color: #0f0;
+    font-family: monospace; font-size: 11px; text-align: right;
+    text-shadow: 1px 1px 2px #000; white-space: pre; display: none;
+  }
+
+  #debug-console {
+    position: fixed; bottom: 40px; left: 10px; z-index: 13;
+    width: 420px; max-height: 240px; overflow-y: auto;
+    background: rgba(0,0,0,0.75); border: 1px solid #0f0;
+    color: #0f0; font-family: monospace; font-size: 11px;
+    padding: 6px 8px; display: none; white-space: pre-wrap;
+  }
+  #debug-console .line { margin-bottom: 2px; }
+  #debug-console .line.dmg { color: #ff5555; }
+  #debug-console .line.skip { color: #888; }
+
   #connection-banner {
     position: fixed; top: 0; left: 0; right: 0; z-index: 50;
     background: #a00; color: #fff; font-family: monospace; font-size: 13px;
@@ -123,6 +140,32 @@
     text-shadow: 1px 1px 3px #000; text-align: center; max-width: 80vw; opacity: 0;
     transition: opacity 1s;
   }
+
+  #match-hud {
+    position: fixed; top: 8px; left: 50%; transform: translateX(-50%);
+    z-index: 11; color: #0f0; font-family: monospace; font-size: 12px;
+    text-align: center; text-shadow: 1px 1px 2px #000; white-space: pre; display: none;
+  }
+
+  #vote-screen, #summary-screen {
+    position: fixed; inset: 0; z-index: 37; background: rgba(0,0,0,0.92);
+    color: #0f0; display: none; align-items: center; justify-content: center;
+    font-family: monospace;
+  }
+  #vote-screen .panel, #summary-screen .panel { width: 480px; max-width: 90vw; }
+  #vote-screen h2, #summary-screen h2 { color: #0ff; margin-bottom: 8px; }
+  #vote-options { display: flex; flex-direction: column; gap: 8px; }
+  .vote-option-btn {
+    background: #111; color: #0f0; border: 1px solid #0f0; text-align: left;
+    padding: 10px 14px; font-family: monospace; font-size: 14px; cursor: pointer;
+  }
+  .vote-option-btn:hover { background: #0f0; color: #000; }
+  .vote-option-btn.picked { background: #0a3d0a; border-color: #6f6; }
+  #vote-timer, #summary-next { margin-top: 14px; opacity: 0.7; font-size: 12px; }
+  #summary-reason { opacity: 0.75; font-size: 12px; margin-bottom: 10px; }
+  #summary-screen table { width: 100%; border-collapse: collapse; }
+  #summary-screen th { text-align: left; border-bottom: 1px solid #555; padding: 4px 12px 4px 0; }
+  #summary-screen td { padding: 4px 12px 4px 0; }
 </style>
 </head>
 <body>
@@ -132,19 +175,42 @@
 <div id="blocker"></div>
 <div id="damage-vignette"></div>
 <div id="kill-feed"></div>
+<div id="coords-display"></div>
+<div id="debug-console"></div>
 <div id="connection-banner">Connection lost - reconnecting...</div>
 <div id="start-line-banner"></div>
 <div id="armor-flip-result"></div>
+<div id="match-hud"></div>
+
+<div id="vote-screen">
+  <div class="panel">
+    <h2 id="vote-title">VOTE</h2>
+    <div id="vote-options"></div>
+    <div id="vote-timer"></div>
+  </div>
+</div>
+
+<div id="summary-screen">
+  <div class="panel">
+    <h2>ROUND OVER</h2>
+    <div id="summary-reason"></div>
+    <table>
+      <thead><tr><th>Player</th><th>Kills</th><th>Deaths</th></tr></thead>
+      <tbody id="summary-body"></tbody>
+    </table>
+    <div id="summary-next">Next: mode vote starting soon...</div>
+  </div>
+</div>
 
 <div id="loadout-screen">
   <div class="panel">
     <h2>CHOOSE YOUR SPECIAL</h2>
     <div class="special-grid" id="special-grid"></div>
 
-    <h2>SECONDARY</h2>
+    <h2 id="loadout-secondary-label">SECONDARY</h2>
     <div class="row"><select id="loadout-secondary"></select></div>
 
-    <h2>PRIMARIES (pick 2)</h2>
+    <h2 id="loadout-primary-label">PRIMARIES (pick 2)</h2>
     <div class="row">
       <select id="loadout-primary-1"></select>
       <select id="loadout-primary-2"></select>

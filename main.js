@@ -5,7 +5,7 @@ import {
   MAP_FILE, MAP_SCALE, DEFAULT_TARGET_LENGTH, DEFAULT_SCALE_MULTIPLIER,
   ANIM_NAMES, NORMAL_FOV, FAKE_SCOPE_FOV, MAX_BULLET_HOLES, WEAPON_CONFIGS,
   MAX_HP, GRAPHICS_PROFILES, ANTI_ALIASING_TIERS,
-  HP_REGEN_DELAY, HP_REGEN_RATE, RESPAWN_DELAY, SPAWN_POINTS,
+  HP_REGEN_DELAY, HP_REGEN_RATE, RESPAWN_DELAY, SPAWN_POINTS, DEATH_BOUNDARY_Y,
   FALL_DAMAGE_SAFE_DISTANCE, FALL_DAMAGE_PER_UNIT_INTERVAL, FALL_DAMAGE_PER_INTERVAL,
   HEAVY_FALL_DAMAGE_MULT, HEAVY_FALL_DAMAGE_ARMOR_MULT,
   FALLOFF_UNIT_INTERVAL, FALLOFF_PER_INTERVAL,
@@ -13,16 +13,19 @@ import {
   STAND_HEIGHT, CROUCH_HEIGHT, PLAYER_RADIUS, LEAN_ANGLE, LEAN_OFFSET,
   BOB_SMOOTHING, BOB_PROFILES, ROOMS,
   SPECIALS, SPECIAL_LIST, HEADSHOT_MULTIPLIER, HEAVY_ARMOR_HP,
+  MAPS, MODES,
 } from './config.js';
 import { createUISystem } from './ui.js';
 import { TargetCube } from './targetCube.js'; // IMPORTED TARGET CUBE
 import { createNetworkSystem, loginOrSignUp, banPlayer, watchAuthState, logOut } from './network.js';
+import { createMatchStateSystem } from './matchState.js';
 
 // ENGINE SETTINGS
 let playerHp = 150;
 let isDead = false;
 let lastDamageTime = -Infinity; // seconds, from performance.now()/1000
 let respawnAt = 0;              // seconds, from performance.now()/1000
+let teleportTick = 0;           // increments every respawn - lets remote clients tell "this frame is a real teleport" apart from normal movement, so they can snap instead of lerping across the map
 let awaitingLoadoutPick = false; // true once the death countdown ends and we're waiting on the picker
 
 // SPECIALS / LOADOUT STATE
@@ -40,10 +43,13 @@ const settings = {
   graphics: 'INSANE',
   msaaSamples: 12, 
   bloomEnabled: true,
-  bobIntensity: 2
+  bobIntensity: 2,
+  showCoords: false
 };
 
 let network = null; // set up once the player picks a room on the connect overlay
+let matchState = null; // Phase 2: round lifecycle / voting, set up alongside network
+let currentLoadedMapFile = MAP_FILE; // tracks what's actually loaded so matchState round changes only reload when the map really changed
 let isAdmin = false;
 let myUid = null;
 let myDisplayName = 'Player';
@@ -275,7 +281,13 @@ const weapons = WEAPON_CONFIGS.map((cfg) => ({
   isReloading: false,
   waitingForBolt: false,
   fireTimer: 0,
+  nextSwingAt: 0, // melee only - cooldown gate, since melee has no magazine
 }));
+
+// Melee weapons (slot: 'melee') are never loadout-picked - everyone always
+// has all of them, on top of whatever guns they chose. Computed once here
+// rather than re-filtering WEAPON_CONFIGS every time it's needed.
+const meleeWeaponIndices = WEAPON_CONFIGS.map((cfg, i) => (cfg.slot === 'melee' ? i : -1)).filter((i) => i !== -1);
 
 let currentIndex = 0;
 function W() { return weapons[currentIndex]; }
@@ -360,15 +372,19 @@ function loadWeaponAssets(index) {
   );
 }
 
-function loadMap(path) {
+let currentMapRoot = null; // tracks the currently-loaded map's scene root so map-vote changes can swap it out cleanly
+
+function loadMap(path, scale = MAP_SCALE) {
   reportAssetLoading('Map');
   loader.load(
     path,
     (gltf) => {
       scene.remove(fallbackGround);
-      gltf.scene.scale.setScalar(MAP_SCALE);
+      if (currentMapRoot) scene.remove(currentMapRoot); // clear the previous map before adding the new one
+      gltf.scene.scale.setScalar(scale);
       scene.add(gltf.scene);
       gltf.scene.updateMatrixWorld(true);
+      currentMapRoot = gltf.scene;
 
       collidables = [];
       gltf.scene.traverse((obj) => {
@@ -430,9 +446,14 @@ function updateHud() {
 
   const w = W();
   if (w.loaded) {
-    lines.push(`AMMO: ${w.ammo}/${w.cfg.magSize}`);
-    if (w.waitingForBolt) lines.push(w.actions['rack'] ? 'CHAMBER EMPTY: PUMP (LMB / T)' : 'CHAMBER EMPTY: BOLT (LMB / T)');
-    if (w.isReloading) lines.push('RELOADING...');
+    if (w.cfg.fireMode === 'melee') {
+      const cooldownLeft = Math.max(0, w.nextSwingAt - performance.now() / 1000);
+      lines.push(cooldownLeft > 0.05 ? `MELEE: ready in ${cooldownLeft.toFixed(1)}s` : 'MELEE: ready');
+    } else {
+      lines.push(`AMMO: ${w.ammo}/${w.cfg.magSize}`);
+      if (w.waitingForBolt) lines.push(w.actions['rack'] ? 'CHAMBER EMPTY: PUMP (LMB / T)' : 'CHAMBER EMPTY: BOLT (LMB / T)');
+      if (w.isReloading) lines.push('RELOADING...');
+    }
   } else {
     lines.push(`Loading ${w.cfg.name}...`);
   }
@@ -441,7 +462,27 @@ function updateHud() {
 
 function tryShoot() {
   const w = W();
-  if (!w.loaded || w.isBusy || w.isReloading) return; 
+  if (!w.loaded || w.isBusy || w.isReloading) return;
+
+  if (w.cfg.fireMode === 'melee') {
+    const now = performance.now() / 1000;
+    if (now < w.nextSwingAt) return; // still on cooldown from the last swing
+    w.nextSwingAt = now + (w.cfg.swingCooldown ?? 0.6);
+
+    w.isBusy = true;
+    playAnim(w, 'shoot', { onFinish: () => { w.isBusy = false; updateHud(); } });
+
+    meleeRaycastHit();
+
+    if (network) {
+      camera.getWorldPosition(_cameraWorldPos);
+      camera.getWorldDirection(_forward);
+      network.sendShoot(_cameraWorldPos, _forward, currentIndex);
+    }
+    updateHud();
+    return;
+  }
+
   if (w.waitingForBolt) { tryBolt(); return; }
   if (w.ammo <= 0) return;
 
@@ -463,7 +504,7 @@ function tryShoot() {
 
   if (w.cfg.pellets && w.cfg.pellets > 1) {
     const pelletCount = w.cfg.pellets;
-    const spread = (w.cfg.spreadAngle ?? 0.05) * getShotgunSpreadMultiplier();
+    const spread = (w.cfg.spreadAngle ?? 0.05) * getPelletSpreadMultiplier(w.cfg);
     for (let i = 0; i < pelletCount; i++) {
       const offsetX = (Math.random() - 0.5) * spread;
       const offsetY = (Math.random() - 0.5) * spread;
@@ -502,7 +543,7 @@ function tryBolt() {
 
 function tryReload() {
   const w = W();
-  if (!w.loaded || w.isBusy || w.isReloading || w.ammo >= w.cfg.magSize) return;
+  if (!w.loaded || w.cfg.fireMode === 'melee' || w.isBusy || w.isReloading || w.ammo >= w.cfg.magSize) return;
   w.isReloading = true; w.isBusy = true;
   updateHud();
 
@@ -553,6 +594,7 @@ function getWeaponDamageMultiplier(cfg) {
   if (currentSpecial.id === 'sniper' && cfg.name === 'Sniper') mult *= currentSpecial.sniperDamageMult;
   if (currentSpecial.id === 'bulletier' && cfg.name === 'SMG') mult *= currentSpecial.smgDamageMult;
   if (currentSpecial.id === 'shotty' && cfg.pellets) mult *= currentSpecial.shotgunDamageMult;
+  if (currentSpecial.id === 'cowboy' && cfg.name === 'Double Barrel') mult *= currentSpecial.doubleBarrelDamageMult;
   if (currentSpecial.id === 'florida' && (cfg.pellets || cfg.name === 'Rifle')) mult *= currentSpecial.shotgunRifleDamageMult;
   return mult;
 }
@@ -565,8 +607,11 @@ function getFireRateMultiplier(cfg) {
   return (currentSpecial && currentSpecial.id === 'bulletier' && cfg.name === 'SMG') ? currentSpecial.smgFireRateMult : 1;
 }
 
-function getShotgunSpreadMultiplier() {
-  return (currentSpecial && currentSpecial.id === 'shotty') ? currentSpecial.shotgunSpreadMult : 1;
+function getPelletSpreadMultiplier(cfg) {
+  let mult = 1;
+  if (currentSpecial && currentSpecial.id === 'shotty') mult *= currentSpecial.shotgunSpreadMult;
+  if (currentSpecial && currentSpecial.id === 'cowboy' && cfg && cfg.name === 'Double Barrel') mult *= currentSpecial.doubleBarrelSpreadMult;
+  return mult;
 }
 
 function computeSpeedMultiplier() {
@@ -589,11 +634,17 @@ function getRegenRateMultiplier() {
 }
 
 function applyPistolTimeScale(w) {
-  if (currentSpecial && currentSpecial.id === 'cowboy' && w.cfg.name === 'Pistol') return currentSpecial.pistolFireRateMult;
+  if (currentSpecial && currentSpecial.id === 'cowboy') {
+    if (w.cfg.name === 'Pistol') return currentSpecial.pistolFireRateMult;
+    if (w.cfg.name === 'Double Barrel') return currentSpecial.doubleBarrelAnimSpeedMult;
+  }
   return 1;
 }
 function applyPistolReloadTimeScale(w) {
-  if (currentSpecial && currentSpecial.id === 'cowboy' && w.cfg.name === 'Pistol') return currentSpecial.pistolReloadSpeedMult;
+  if (currentSpecial && currentSpecial.id === 'cowboy') {
+    if (w.cfg.name === 'Pistol') return currentSpecial.pistolReloadSpeedMult;
+    if (w.cfg.name === 'Double Barrel') return currentSpecial.doubleBarrelAnimSpeedMult;
+  }
   return 1;
 }
 
@@ -601,6 +652,74 @@ function getFalloffAdjustedDamage(baseDamage, cfg, distance) {
   if (cfg.exemptFromFalloff) return baseDamage;
   const intervals = Math.floor(distance / FALLOFF_UNIT_INTERVAL);
   return Math.max(0, baseDamage - intervals * FALLOFF_PER_INTERVAL);
+}
+
+// Looks up damage by distance against a melee weapon's hitZones, in order -
+// first zone whose maxDistance covers the hit wins. Deliberately separate
+// from the ranged-weapon falloff system (getFalloffAdjustedDamage) since
+// melee's damage model is "which zone did this land in", not "how many
+// units did the bullet travel".
+function getMeleeDamage(cfg, distance) {
+  const zones = cfg.hitZones || [{ maxDistance: Infinity, damageMult: 1 }];
+  for (const zone of zones) {
+    if (distance <= zone.maxDistance) return (cfg.damage || 0) * zone.damageMult;
+  }
+  return 0; // beyond every zone - shouldn't happen, raycaster.far is capped to the last zone's maxDistance below
+}
+
+// Melee swing hit-detection. Reuses raycastHit's remote-player-hit logic
+// (headshot detection, Lucky's crit/insta-down, network.sendHit) but with
+// the raycast capped to the weapon's reach (raycaster.far) and damage
+// computed from hitZones instead of range falloff. No bullet hole/tracer -
+// doesn't make sense visually for a melee swing.
+function meleeRaycastHit() {
+  const w = W();
+  const zones = w.cfg.hitZones || [{ maxDistance: 2, damageMult: 1 }];
+  const maxRange = zones[zones.length - 1].maxDistance;
+
+  const raycaster = new THREE.Raycaster();
+  _scratchVec2D.set(0, 0);
+  raycaster.setFromCamera(_scratchVec2D, camera);
+  raycaster.far = maxRange;
+
+  const hits = raycaster.intersectObjects(collidables, true);
+  const wallDist = hits.length ? hits[0].distance : Infinity;
+
+  if (network) {
+    const remoteMeshes = network.getRemotePlayerMeshes();
+    if (remoteMeshes.length > 0) {
+      const playerHits = raycaster.intersectObjects(remoteMeshes, true);
+      if (playerHits.length > 0 && playerHits[0].distance < wallDist) {
+        const hitObj = playerHits[0].object;
+        const hitId = hitObj.userData.remotePlayerId;
+        const isHeadshot = !!hitObj.userData.isHeadshot;
+
+        if (hitId) {
+          let dmg = getMeleeDamage(w.cfg, playerHits[0].distance) * getWeaponDamageMultiplier(w.cfg);
+          const bodyEquivalentDamage = dmg;
+
+          if (isHeadshot) dmg *= HEADSHOT_MULTIPLIER;
+
+          let instaDown = false;
+          if (currentSpecial && currentSpecial.id === 'lucky') {
+            if (Math.random() < currentSpecial.critChance) dmg *= currentSpecial.critMult;
+            if (isHeadshot && Math.random() < currentSpecial.headshotInstaDownChance) instaDown = true;
+          }
+          if (instaDown) {
+            const targetKnownHp = network.getRemotePlayers().get(hitId)?.hp ?? 150;
+            dmg = Math.max(dmg, targetKnownHp - 1);
+          }
+
+          network.sendHit(hitId, dmg, isHeadshot, bodyEquivalentDamage);
+        }
+      }
+    }
+  }
+
+  if (hits.length && hits[0].object.userData.isTargetCube) {
+    const dmg = getMeleeDamage(w.cfg, hits[0].distance);
+    hits[0].object.userData.parentInstance.takeDamage(dmg);
+  }
 }
 
 function raycastHit(offsetX = 0, offsetY = 0) {
@@ -695,7 +814,7 @@ function raycastHit(offsetX = 0, offsetY = 0) {
 document.addEventListener('mousedown', (e) => {
   if (!controls.isLocked || isDead) return;
   if (e.button === 0) { leftMouseDown = true; tryShoot(); }
-  if (e.button === 2) setScope(true); 
+  if (e.button === 2 && W().cfg.fireMode !== 'melee') setScope(true);
 });
 document.addEventListener('mouseup', (e) => {
   if (e.button === 0) leftMouseDown = false;
@@ -705,12 +824,22 @@ document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Tab') { e.preventDefault(); toggleMenu(); return; }
+  if (e.code === 'Equal') { toggleDebugConsole(); return; }
 
   if (!controls.isLocked || isDead) return;
   switch (e.code) {
     case 'KeyR': tryReload(); break;
     case 'KeyH': tryInspect(); break;
     case 'KeyT': tryBolt(); break; 
+    case 'KeyV': {
+      // Melee is always owned regardless of loadout - dedicated key rather
+      // than relying on the number-key/wheel cycling through loadoutOrder,
+      // so it's a fast quick-swap even if the player doesn't remember which
+      // slot it landed in.
+      const meleeIdx = meleeWeaponIndices.find((i) => weapons[i] && weapons[i].loaded);
+      if (meleeIdx !== undefined) switchWeapon(meleeIdx);
+      break;
+    }
     case 'Space':
       if (grounded) { verticalVelocity = JUMP_SPEED; grounded = false; }
       break;
@@ -761,6 +890,145 @@ function flashDamage(amount) {
 }
 
 const killFeedEl = document.getElementById('kill-feed');
+
+// -----------------------------
+// MATCH STATE UI (Phase 2) - HUD showing current mode/map/time, plus the
+// vote and post-match summary overlays. Driven by matchState's onStateChange
+// callback (fires on every Firebase change) and a 1s ticker for the live
+// countdown, since the countdown needs to move even between state changes.
+// -----------------------------
+const matchHudEl = document.getElementById('match-hud');
+const voteScreenEl = document.getElementById('vote-screen');
+const voteTitleEl = document.getElementById('vote-title');
+const voteOptionsEl = document.getElementById('vote-options');
+const voteTimerEl = document.getElementById('vote-timer');
+const summaryScreenEl = document.getElementById('summary-screen');
+const summaryReasonEl = document.getElementById('summary-reason');
+const summaryBodyEl = document.getElementById('summary-body');
+const summaryNextEl = document.getElementById('summary-next');
+
+let lastRenderedPhase = null;
+let myLastVoteChoice = null;
+
+function formatTimeRemaining(ms) {
+  const totalSec = Math.max(0, Math.ceil(ms / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function renderVoteScreen(title, options, onPick) {
+  voteTitleEl.textContent = title;
+  myLastVoteChoice = null;
+  voteOptionsEl.innerHTML = '';
+  options.forEach(({ id, label, description }) => {
+    const btn = document.createElement('button');
+    btn.className = 'vote-option-btn';
+    btn.textContent = description ? `${label} - ${description}` : label;
+    btn.addEventListener('click', () => {
+      myLastVoteChoice = id;
+      onPick(id);
+      voteOptionsEl.querySelectorAll('.vote-option-btn').forEach((b) => b.classList.remove('picked'));
+      btn.classList.add('picked');
+    });
+    voteOptionsEl.appendChild(btn);
+  });
+}
+
+function renderSummaryScreen(state) {
+  const reasonText = state.endReason === 'score_cap' ? 'Score cap reached.'
+    : state.endReason === 'time_limit' ? "Time's up."
+    : 'Round ended.';
+  summaryReasonEl.textContent = reasonText;
+
+  const players = matchState ? matchState.getPlayers() : {};
+  const rows = Object.entries(players).map(([id, p]) => ({
+    name: p.name || 'Player',
+    kills: p.roundKills || 0,
+    deaths: p.deaths || 0,
+  }));
+  // Include ourselves - matchState's players snapshot is everyone in the
+  // room INCLUDING us (it reads the same players/$room node network.js
+  // writes to), so no separate "(you)" row is needed here like the
+  // scoreboard's client-side-only rows list does.
+  rows.sort((a, b) => b.kills - a.kills);
+
+  summaryBodyEl.innerHTML = rows.map((r) => `
+    <tr><td>${r.name}</td><td>${r.kills}</td><td>${r.deaths}</td></tr>
+  `).join('') || '<tr><td colspan="3" style="opacity:0.6;">No scores recorded.</td></tr>';
+}
+
+function handleMatchStateChange(state) {
+  if (!state) return;
+
+  const mode = MODES[state.currentMode];
+  const mapDef = MAPS.find((m) => m.id === state.currentMap);
+
+  if (state.phase === 'playing' && mapDef && mapDef.file !== currentLoadedMapFile) {
+    currentLoadedMapFile = mapDef.file;
+    loadMap(mapDef.file, mapDef.scale);
+  }
+
+  if (state.phase !== lastRenderedPhase) {
+    lastRenderedPhase = state.phase;
+
+    if (state.phase === 'intermission') {
+      renderSummaryScreen(state);
+      voteScreenEl.style.display = 'none';
+      summaryScreenEl.style.display = 'flex';
+    } else if (state.phase === 'voting_mode') {
+      summaryScreenEl.style.display = 'none';
+      const options = (state.modeVoteOptions || []).map((id) => ({
+        id, label: (MODES[id] || {}).name || id, description: (MODES[id] || {}).description,
+      }));
+      renderVoteScreen('VOTE: NEXT MODE', options, (id) => matchState.submitModeVote(id));
+      voteScreenEl.style.display = 'flex';
+    } else if (state.phase === 'voting_map') {
+      const options = (state.mapVoteOptions || []).map((id) => ({
+        id, label: (MAPS.find((m) => m.id === id) || {}).name || id,
+      }));
+      renderVoteScreen('VOTE: NEXT MAP', options, (id) => matchState.submitMapVote(id));
+      voteScreenEl.style.display = 'flex';
+    } else if (state.phase === 'playing') {
+      voteScreenEl.style.display = 'none';
+      summaryScreenEl.style.display = 'none';
+    }
+  }
+
+  if (matchHudEl) {
+    let timeStr = '';
+    if (state.phase === 'playing' && mode && mode.timeLimitSec) {
+      const remainingMs = (mode.timeLimitSec * 1000) - (Date.now() - (state.roundStartedAt || Date.now()));
+      timeStr = ` | ${formatTimeRemaining(remainingMs)}`;
+    }
+    matchHudEl.textContent = `${mode ? mode.name : '?'} - ${mapDef ? mapDef.name : '?'}${timeStr}`;
+    matchHudEl.style.display = 'block';
+  }
+}
+
+// Live countdown ticker - the HUD/vote timers need to move every second
+// even between actual Firebase state changes.
+setInterval(() => {
+  if (!matchState) return;
+  const state = matchState.getState();
+  if (!state) return;
+
+  if (matchHudEl && state.phase === 'playing') {
+    const mode = MODES[state.currentMode];
+    const mapDef = MAPS.find((m) => m.id === state.currentMap);
+    let timeStr = '';
+    if (mode && mode.timeLimitSec) {
+      const remainingMs = (mode.timeLimitSec * 1000) - (Date.now() - (state.roundStartedAt || Date.now()));
+      timeStr = ` | ${formatTimeRemaining(remainingMs)}`;
+    }
+    matchHudEl.textContent = `${mode ? mode.name : '?'} - ${mapDef ? mapDef.name : '?'}${timeStr}`;
+  }
+
+  if (voteTimerEl && (state.phase === 'voting_mode' || state.phase === 'voting_map') && state.phaseEndsAt) {
+    voteTimerEl.textContent = `Voting ends in ${formatTimeRemaining(state.phaseEndsAt - Date.now())}`;
+  }
+}, 1000);
+
 function pushKillFeed(text) {
   const line = document.createElement('div');
   line.textContent = text;
@@ -768,6 +1036,29 @@ function pushKillFeed(text) {
   setTimeout(() => { line.style.opacity = '0'; }, 4000);
   setTimeout(() => { line.remove(); }, 6000);
   while (killFeedEl.children.length > 5) killFeedEl.removeChild(killFeedEl.firstChild);
+}
+
+// -----------------------------
+// DEBUG CONSOLE - toggled with '=' key. Shows a rolling log in-game
+// (not just the browser devtools console), capped to the last 40 lines.
+// -----------------------------
+const debugConsoleEl = document.getElementById('debug-console');
+let debugConsoleOn = false;
+
+function toggleDebugConsole() {
+  debugConsoleOn = !debugConsoleOn;
+  if (debugConsoleEl) debugConsoleEl.style.display = debugConsoleOn ? 'block' : 'none';
+}
+
+function debugLog(text, cls = '') {
+  console.log(`[debug] ${text}`);
+  if (!debugConsoleEl) return;
+  const line = document.createElement('div');
+  line.className = 'line' + (cls ? ` ${cls}` : '');
+  line.textContent = text;
+  debugConsoleEl.appendChild(line);
+  while (debugConsoleEl.children.length > 40) debugConsoleEl.removeChild(debugConsoleEl.firstChild);
+  debugConsoleEl.scrollTop = debugConsoleEl.scrollHeight;
 }
 
 // -----------------------------
@@ -780,12 +1071,20 @@ function pushKillFeed(text) {
 // NOTE: intentionally doesn't interact with Lucky's "survive a lethal hit"
 // perk - that's flavored around surviving gunfire, not falls.
 function applyFallDamage(fallDistance) {
-  if (isDead || fallDistance <= FALL_DAMAGE_SAFE_DISTANCE) return;
+  if (isDead) return;
+
+  if (fallDistance <= FALL_DAMAGE_SAFE_DISTANCE) {
+    debugLog(`fall: ${fallDistance.toFixed(2)} units (under ${FALL_DAMAGE_SAFE_DISTANCE} threshold, no damage)`, 'skip');
+    return;
+  }
 
   const overage = fallDistance - FALL_DAMAGE_SAFE_DISTANCE;
   const intervals = Math.floor(overage / FALL_DAMAGE_PER_UNIT_INTERVAL);
   let dmg = intervals * FALL_DAMAGE_PER_INTERVAL;
-  if (dmg <= 0) return;
+  if (dmg <= 0) {
+    debugLog(`fall: ${fallDistance.toFixed(2)} units (over threshold but rounds to 0 dmg)`, 'skip');
+    return;
+  }
 
   if (currentSpecial && currentSpecial.id === 'heavy') {
     dmg *= HEAVY_FALL_DAMAGE_MULT;
@@ -801,6 +1100,8 @@ function applyFallDamage(fallDistance) {
     armorHp -= absorbed;
     dmg -= absorbed;
   }
+
+  debugLog(`fall: ${fallDistance.toFixed(2)} units -> ${dmg.toFixed(1)} dmg`, 'dmg');
 
   playerHp = Math.max(0, playerHp - dmg);
   lastDamageTime = performance.now() / 1000;
@@ -833,6 +1134,7 @@ function actuallyRespawn() {
   awaitingLoadoutPick = false;
   lastDamageTime = performance.now() / 1000;
   usedLuckySurvive = false; // resets every life
+  teleportTick++; // tells remote clients this position update is a real teleport, not movement
   updateHud();
 }
 
@@ -844,6 +1146,8 @@ const specialGrid = document.getElementById('special-grid');
 const secondarySelect = document.getElementById('loadout-secondary');
 const primary1Select = document.getElementById('loadout-primary-1');
 const primary2Select = document.getElementById('loadout-primary-2');
+const secondaryLabelEl = document.getElementById('loadout-secondary-label');
+const primaryLabelEl = document.getElementById('loadout-primary-label');
 const loadoutConfirmBtn = document.getElementById('loadout-confirm-btn');
 const armorChoiceRow = document.getElementById('armor-choice-row');
 const armorCheckbox = document.getElementById('loadout-armor-checkbox');
@@ -877,6 +1181,18 @@ function buildSpecialGrid() {
 
 function buildWeaponSelects() {
   const special = SPECIALS[selectedSpecialId];
+  // Cowboy forces a different loadout shape: 2 secondaries + 1 primary
+  // instead of the usual 1 secondary + 2 primaries. Rather than restructure
+  // the loadout screen's HTML, the three existing <select> elements just
+  // get repurposed - secondarySelect + primary1Select both pull from the
+  // secondary pool, primary2Select becomes the sole primary pick. The
+  // confirm handler doesn't care which pool each select drew from, so it
+  // needs no changes at all.
+  const cowboyLayout = special.maxSecondaries === 2 && special.maxPrimaries === 1;
+
+  if (secondaryLabelEl) secondaryLabelEl.textContent = cowboyLayout ? 'SECONDARIES (pick 2)' : 'SECONDARY';
+  if (primaryLabelEl) primaryLabelEl.textContent = cowboyLayout ? 'PRIMARY' : 'PRIMARIES (pick 2)';
+
   const secondaries = WEAPON_CONFIGS
     .map((cfg, i) => ({ cfg, i }))
     .filter(({ cfg }) => cfg.slot === 'secondary' || (special.allowDoubleBarrelSecondary && cfg.name === 'Double Barrel'));
@@ -884,25 +1200,32 @@ function buildWeaponSelects() {
     .map((cfg, i) => ({ cfg, i }))
     .filter(({ cfg }) => cfg.slot === 'primary');
 
-  const prevSecondaryVal = secondarySelect.value;
-  secondarySelect.innerHTML = secondaries.map(({ cfg, i }) => `<option value="${i}">${cfg.name}</option>`).join('');
-  if ([...secondarySelect.options].some(o => o.value === prevSecondaryVal)) secondarySelect.value = prevSecondaryVal;
-
-  function fillPrimarySelect(sel, excludeIndices) {
+  function fillSelectFromPool(sel, pool, excludeIndices) {
     const prevVal = sel.value;
-    sel.innerHTML = primaries
+    sel.innerHTML = pool
       .filter(({ i }) => !excludeIndices.includes(i))
       .map(({ cfg, i }) => `<option value="${i}">${cfg.name}</option>`).join('');
     if ([...sel.options].some(o => o.value === prevVal)) sel.value = prevVal;
   }
 
-  const secIdx = parseInt(secondarySelect.value, 10);
-  // Each primary dropdown excludes: the other primary's pick, AND whatever's
-  // currently chosen as secondary - otherwise (e.g. Shotty's Double Barrel
-  // secondary option) the same weapon could end up double-booked into two
-  // slots at once, silently costing you one of your three intended weapons.
-  fillPrimarySelect(primary1Select, [parseInt(primary2Select.value, 10), secIdx]);
-  fillPrimarySelect(primary2Select, [parseInt(primary1Select.value, 10), secIdx]);
+  if (cowboyLayout) {
+    // secondarySelect and primary1Select both draw from the secondary pool
+    // (excluding whatever the other one currently has picked, so the same
+    // weapon can't get double-booked into both slots); primary2Select is
+    // the single primary pick, independent of the other two.
+    fillSelectFromPool(secondarySelect, secondaries, [parseInt(primary1Select.value, 10)]);
+    fillSelectFromPool(primary1Select, secondaries, [parseInt(secondarySelect.value, 10)]);
+    fillSelectFromPool(primary2Select, primaries, []);
+  } else {
+    fillSelectFromPool(secondarySelect, secondaries, []);
+    const secIdx = parseInt(secondarySelect.value, 10);
+    // Each primary dropdown excludes: the other primary's pick, AND whatever's
+    // currently chosen as secondary - otherwise (e.g. Shotty's Double Barrel
+    // secondary option) the same weapon could end up double-booked into two
+    // slots at once, silently costing you one of your three intended weapons.
+    fillSelectFromPool(primary1Select, primaries, [parseInt(primary2Select.value, 10), secIdx]);
+    fillSelectFromPool(primary2Select, primaries, [parseInt(primary1Select.value, 10), secIdx]);
+  }
 
   armorChoiceRow.style.display = (special.id === 'heavy') ? 'block' : 'none';
   if (special.id !== 'heavy') armorCheckbox.checked = false;
@@ -939,13 +1262,14 @@ loadoutConfirmBtn.addEventListener('click', () => {
   const secIdx = parseInt(secondarySelect.value, 10);
   const p1Idx = parseInt(primary1Select.value, 10);
   const p2Idx = parseInt(primary2Select.value, 10);
-  allowedWeaponIndices = new Set([secIdx, p1Idx, p2Idx]);
-  loadoutOrder = [secIdx, p1Idx, p2Idx];
+  allowedWeaponIndices = new Set([secIdx, p1Idx, p2Idx, ...meleeWeaponIndices]);
+  loadoutOrder = [secIdx, p1Idx, p2Idx, ...meleeWeaponIndices];
 
   // Reset ammo on the chosen loadout so every life starts topped up
   [secIdx, p1Idx, p2Idx].forEach((i) => {
     if (weapons[i]) weapons[i].ammo = WEAPON_CONFIGS[i].magSize;
   });
+  meleeWeaponIndices.forEach((i) => { if (weapons[i]) weapons[i].nextSwingAt = 0; });
   // Hide whatever pivot was visible before (usually the Pistol, loaded
   // first at index 0) and show the actually-selected secondary's pivot -
   // just reassigning currentIndex here (without this) left the old
@@ -1108,6 +1432,14 @@ function movePlayer(delta) {
   }
 
   sunGroup.position.set(playerPos.x + 450, playerPos.y + 750, playerPos.z + 250);
+
+  // DEATH BOUNDARY - catches anyone who clips out of the map or falls off an
+  // edge with no floor below, instead of falling forever. Only applies to
+  // normal movement, not noclip/freecam (both return early above), since
+  // admins intentionally fly outside normal bounds with those.
+  if (!isDead && playerPos.y < DEATH_BOUNDARY_Y) {
+    die(null); // environmental death - no killer credited
+  }
 }
 
 let scoreboardRefreshTimer = 0;
@@ -1120,6 +1452,14 @@ function animate() {
 
   // TICK THE TARGET TRACKER
   myTarget.update();
+
+  if (settings.showCoords) {
+    const coordsEl = document.getElementById('coords-display');
+    if (coordsEl) {
+      const p = freecam ? freecamPos : playerPos;
+      coordsEl.textContent = `X: ${p.x.toFixed(2)}\nY: ${p.y.toFixed(2)}\nZ: ${p.z.toFixed(2)}` + (freecam ? '\n(freecam)' : '');
+    }
+  }
 
   if (isDead) {
     if (performance.now() / 1000 >= respawnAt && !awaitingLoadoutPick) {
@@ -1320,6 +1660,7 @@ function startNetwork(uid, playerName, room, adminFlag) {
       scale: computeScaleMultiplier(),
       weaponIndex: currentIndex,
       hp: playerHp,
+      tp: teleportTick,
     }),
     onLocalPlayerHit: (fromId, fromName, damage, isHeadshot, bodyEquivalentDamage) => {
       if (isDead) return;
@@ -1366,7 +1707,10 @@ function startNetwork(uid, playerName, room, adminFlag) {
     },
     onKillFeed: (killerName, victimName) => {
       pushKillFeed(`${killerName} killed ${victimName}`);
-      if (killerName === myDisplayName) network.registerLocalKill();
+      if (killerName === myDisplayName) {
+        network.registerLocalKill();
+        if (matchState) matchState.reportKill();
+      }
     },
     onRemoteShot: (id, origin, dir) => {
       drawRemoteTracer(origin, dir);
@@ -1379,6 +1723,23 @@ function startNetwork(uid, playerName, room, adminFlag) {
       // connect, which isn't a "lost connection" event.
       banner.style.display = (!isUp && hasEverConnected) ? 'block' : 'none';
     },
+    onForceKick: () => {
+      // Scheduled 8-hour server reset. Show it plainly rather than silently
+      // yanking someone mid-match, then reload so the whole connect/login/
+      // room-select flow re-runs clean instead of trying to patch a half-torn-
+      // down game state back together.
+      const banner = document.getElementById('connection-banner');
+      if (banner) {
+        banner.textContent = 'Scheduled server reset - reconnecting in a few seconds...';
+        banner.style.display = 'block';
+      }
+      setTimeout(() => window.location.reload(), 4000);
+    },
+  });
+
+  matchState = createMatchStateSystem({
+    room, uid,
+    onStateChange: handleMatchStateChange,
   });
 }
 
